@@ -491,6 +491,22 @@ jobs:
           path: "scratch/artifacts/xenios_ios_iphone_ipad.ipa"
           if-no-files-found: error
 
+      - name: Publish the IPA as a fork release
+        # fork: a public release per build, the previous fork-build-* release removed
+        if: "${{ github.repository_owner == 'john62036203-ops' }}"
+        shell: bash
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          set -euo pipefail
+          tag="fork-build-${GITHUB_RUN_NUMBER}"
+          old="$(gh release list -R "$GITHUB_REPOSITORY" -L 50 --json tagName -q '.[].tagName' | grep '^fork-build-' || true)"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "XeniOS fork build ${GITHUB_RUN_NUMBER}" \
+            --notes "Branch ${GITHUB_REF_NAME}, commit ${GITHUB_SHA:0:7}. Unsigned; install with SideStore." \
+            "scratch/artifacts/xenios_ios_iphone_ipad.ipa"
+          for t in $old; do [ "$t" = "$tag" ] || gh release delete "$t" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true; done
+
       - name: Upload the crash symbol map
         uses: actions/upload-artifact@v4
         with:
