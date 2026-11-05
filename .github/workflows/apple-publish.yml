@@ -63,6 +63,14 @@ name: Apple Publish
         description: "Release notes in Markdown (optional; replaces the body of an existing release)"
         required: false
         type: string
+      runner:
+        description: "fork: macOS runner for the iOS build"
+        required: false
+        default: "macos-26"
+        type: choice
+        options:
+          - "macos-26"
+          - "macos-15-intel"
       publish:
         description: "Publish the GitHub release and the xenios.jp manifests (off: build the IPA only)"
         required: true
@@ -82,7 +90,7 @@ permissions:
 # halfway can leave a release without its manifest entry. Only build-only runs
 # (ci/** pushes, publish off) are per ref and cancel-in-progress.
 concurrency:
-  group: "${{ ((github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/ci/')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && 'apple-publish-publish' || format('apple-publish-build-{0}', github.ref) }}"
+  group: "${{ ((github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/ci/')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) && 'apple-publish-publish' || format('apple-publish-build-{0}-{1}', github.ref, inputs.runner || 'macos-26') }}"
   cancel-in-progress: "${{ !((github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/ci/')) || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}"
 
 env:
@@ -305,7 +313,7 @@ jobs:
       - resolve-metadata
     # The iOS 27 SDK is needed (crash reporter extension, StateReporting); the
     # macos-26 image tops out at Xcode 26.
-    runs-on: macos-26
+    runs-on: ${{ inputs.runner || 'macos-26' }}
     timeout-minutes: 360
 
     steps:
