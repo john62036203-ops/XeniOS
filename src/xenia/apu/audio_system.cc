@@ -13,6 +13,9 @@
 #include <chrono>
 #include <limits>
 #include <thread>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include "xenia/cpu/ppc/ppc_context.h"
 
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/audio_driver.h"
@@ -60,6 +63,59 @@ namespace {
 std::atomic<uint64_t> g_ad_pumps{0}, g_ad_sem_drops{0}, g_ad_cb_begin{0}, g_ad_cb_end{0};
 std::atomic<uint64_t> g_ad_cb_max_us{0}, g_ad_cb_since_us{0}, g_ad_parked{0};
 std::atomic<bool> g_ad_started{false};
+std::atomic<xe::cpu::ppc::PPCContext*> g_ad_ctx{nullptr};
+std::atomic<mach_port_t> g_ad_mach{MACH_PORT_NULL};
+// When the worker has been inside one guest callback for >1 s: the guest
+// registers and the host call stack of the worker, to see what it waits on.
+void AdDumpStuck() {
+  if (auto* ctx = g_ad_ctx.load()) {
+    XELOGI("[audio-diag] stuck guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X}",
+           uint32_t(ctx->lr), uint32_t(ctx->ctr), uint32_t(ctx->r[1]), uint32_t(ctx->r[3]),
+           uint32_t(ctx->r[4]), uint32_t(ctx->r[5]));
+  }
+  mach_port_t th = g_ad_mach.load();
+  if (th == MACH_PORT_NULL) return;
+#if defined(__aarch64__)
+  arm_thread_state64_t st;
+  mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+  if (thread_suspend(th) != KERN_SUCCESS) return;
+  if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &count) == KERN_SUCCESS) {
+    uint64_t pcs[20];
+    int n = 0;
+    pcs[n++] = arm_thread_state64_get_pc(st);
+    pcs[n++] = arm_thread_state64_get_lr(st);
+    uint64_t fp = arm_thread_state64_get_fp(st);
+    for (int i = 0; i < 16 && fp && (fp & 7) == 0; ++i) {
+      vm_size_t got = 0;
+      uint64_t frame[2] = {0, 0};
+      if (vm_read_overwrite(mach_task_self(), fp, sizeof(frame), (vm_address_t)frame, &got) !=
+              KERN_SUCCESS ||
+          got != sizeof(frame)) {
+        break;
+      }
+      if (frame[1]) pcs[n++] = frame[1];
+      if (frame[0] <= fp || n >= 20) break;
+      fp = frame[0];
+    }
+    thread_resume(th);
+    for (int i = 0; i < n; ++i) {
+      Dl_info info = {};
+      const uint64_t pc = pcs[i] & 0x0000FFFFFFFFFFFFull;
+      if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_sname) {
+        XELOGI("[audio-diag]   #{} {:x} {}+{:#x}", i, pc, info.dli_sname,
+               pc - reinterpret_cast<uint64_t>(info.dli_saddr));
+      } else if (info.dli_fbase) {
+        XELOGI("[audio-diag]   #{} {:x} {}+{:#x}", i, pc,
+               info.dli_fname ? info.dli_fname : "?", pc - reinterpret_cast<uint64_t>(info.dli_fbase));
+      } else {
+        XELOGI("[audio-diag]   #{} {:x} (JIT or unknown)", i, pc);
+      }
+    }
+    return;
+  }
+  thread_resume(th);
+#endif
+}
 uint64_t AdNowUs() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
@@ -69,7 +125,7 @@ void AdStartWatch() {
   if (g_ad_started.exchange(true)) return;
   std::thread([] {
     uint64_t last_end = 0;
-    for (int i = 0; i < 90; ++i) {   // ~3 minutes
+    for (int i = 0; i < 300; ++i) {   // ~10 minutes
       std::this_thread::sleep_for(std::chrono::seconds(2));
       const uint64_t b = g_ad_cb_begin.load(), e = g_ad_cb_end.load();
       const uint64_t since = g_ad_cb_since_us.load();
@@ -80,6 +136,11 @@ void AdStartWatch() {
              g_ad_cb_max_us.load() / 1000, in_cb_ms, g_ad_parked.load(),
              xe::logging::GetFrameNumber());
       last_end = e;
+      static int dumps = 0;
+      if (in_cb_ms > 1000 && dumps < 3) {
+        ++dumps;
+        AdDumpStuck();
+      }
     }
   }).detach();
 }
@@ -243,6 +304,10 @@ void AudioSystem::WorkerThreadMain() {
       uint64_t args[] = {client_callback_arg};
       const uint64_t cb_t0 = AdNowUs();
       g_ad_cb_since_us.store(cb_t0, std::memory_order_relaxed);
+      if (!g_ad_ctx.load(std::memory_order_relaxed)) {
+        g_ad_ctx.store(worker_thread_->thread_state()->context());
+        g_ad_mach.store(mach_thread_self());
+      }
       g_ad_cb_begin.fetch_add(1, std::memory_order_relaxed);
       processor_->Execute(worker_thread_->thread_state(), client_callback, args,
                           xe::countof(args));
