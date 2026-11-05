@@ -14,6 +14,16 @@
 #include <algorithm>
 #include <chrono>
 #include <vector>
+#include <string>
+
+#include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
+
+DEFINE_string(ios_controller_face_buttons, "auto",
+              "How a physical controller's A/B/X/Y reach the game: position (as iOS "
+              "reports them), label (by printed letter, swapping A/B and X/Y), or auto "
+              "(label on Nintendo-layout pads, position otherwise).",
+              "iOS");
 
 #import "xenia/ui/ios/settings/ios_log_view_controller.h"
 #import "xenia/ui/ios/shared/ios_alert_actions.h"
@@ -1212,6 +1222,35 @@ void FollowCursorRing(UITableView* table_view, NSIndexPath* path) {
   [self handleInGameControllerActions:actions];
 }
 
+// fork: Nintendo-layout pads (Switch Pro, Joy-Con, pads in Switch mode) have A/B
+// and X/Y printed swapped relative to Xbox. GameController reports buttons by
+// position, so "label" (or "auto" on a Nintendo pad) maps by printed letter.
+static bool XeForkSwapFaceButtons(GCController* controller) {
+  static NSMutableSet<NSString*>* logged = [[NSMutableSet alloc] init];
+  NSString* category = controller.productCategory ?: @"";
+  NSString* vendor = controller.vendorName ?: @"";
+  bool swap = false;
+  const std::string& mode = cvars::ios_controller_face_buttons;
+  if (mode == "label") {
+    swap = true;
+  } else if (mode == "auto") {
+    for (NSString* key in @[ @"Switch", @"Joy-Con", @"Nintendo", @"Pro Controller" ]) {
+      if ([category rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound ||
+          [vendor rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        swap = true;
+      }
+    }
+  }
+  NSString* key = [NSString stringWithFormat:@"%@|%@", category, vendor];
+  if (![logged containsObject:key]) {
+    [logged addObject:key];
+    XELOGI("[controller] '{}' / '{}': face buttons by {} (ios_controller_face_buttons={})",
+           [vendor UTF8String], [category UTF8String], swap ? "printed label" : "position",
+           mode);
+  }
+  return swap;
+}
+
 - (BOOL)readNativeControllerState:(xe::hid::X_INPUT_STATE*)out_state {
   if (!out_state) {
     return NO;
@@ -1235,10 +1274,11 @@ void FollowCursorRing(UITableView* table_view, NSIndexPath* path) {
     set_button(gamepad.dpad.down.pressed, xe::hid::X_INPUT_GAMEPAD_DPAD_DOWN);
     set_button(gamepad.dpad.left.pressed, xe::hid::X_INPUT_GAMEPAD_DPAD_LEFT);
     set_button(gamepad.dpad.right.pressed, xe::hid::X_INPUT_GAMEPAD_DPAD_RIGHT);
-    set_button(gamepad.buttonA.pressed, xe::hid::X_INPUT_GAMEPAD_A);
-    set_button(gamepad.buttonB.pressed, xe::hid::X_INPUT_GAMEPAD_B);
-    set_button(gamepad.buttonX.pressed, xe::hid::X_INPUT_GAMEPAD_X);
-    set_button(gamepad.buttonY.pressed, xe::hid::X_INPUT_GAMEPAD_Y);
+    const bool swap_face = XeForkSwapFaceButtons(controller);
+    set_button(gamepad.buttonA.pressed, swap_face ? xe::hid::X_INPUT_GAMEPAD_B : xe::hid::X_INPUT_GAMEPAD_A);
+    set_button(gamepad.buttonB.pressed, swap_face ? xe::hid::X_INPUT_GAMEPAD_A : xe::hid::X_INPUT_GAMEPAD_B);
+    set_button(gamepad.buttonX.pressed, swap_face ? xe::hid::X_INPUT_GAMEPAD_Y : xe::hid::X_INPUT_GAMEPAD_X);
+    set_button(gamepad.buttonY.pressed, swap_face ? xe::hid::X_INPUT_GAMEPAD_X : xe::hid::X_INPUT_GAMEPAD_Y);
     set_button(gamepad.leftShoulder.pressed, xe::hid::X_INPUT_GAMEPAD_LEFT_SHOULDER);
     set_button(gamepad.rightShoulder.pressed, xe::hid::X_INPUT_GAMEPAD_RIGHT_SHOULDER);
 
