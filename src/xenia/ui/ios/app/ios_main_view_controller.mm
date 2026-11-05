@@ -36,6 +36,9 @@
 #include "xenia/base/string.h"
 #include "xenia/config.h"
 #include "xenia/gpu/shader_storage.h"
+#include "xenia/base/clock.h"
+#include "xenia/gpu/metal/metal_compile_activity.h"
+#include "xenia/ui/metal/metal_presenter.h"
 #include "xenia/hid/input.h"
 #include "xenia/vfs/stfs_metadata.h"
 #include "xenia/xbox.h"
@@ -683,6 +686,8 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
     __block uint32_t last_frame = xe::logging::GetFrameNumber();
     __block CFTimeInterval last_time = CACurrentMediaTime();
     __block int ticks = 0;
+    __block uint64_t last_busy_ns = 0, last_wait_ticks = 0, last_drawable_ticks = 0;
+    const double tick_hz = double(xe::Clock::QueryHostTickFrequency());
     XeniaViewController* fps_owner = self;
     [NSTimer scheduledTimerWithTimeInterval:0.5
                                     repeats:YES
@@ -690,8 +695,21 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
       const uint32_t frame = xe::logging::GetFrameNumber();
       const CFTimeInterval t = CACurrentMediaTime();
       const double fps = t > last_time ? (frame - last_frame) / (t - last_time) : 0.0;
+      const uint32_t frames = frame - last_frame;
       last_frame = frame;
       last_time = t;
+      // GPU busy and command-processor GPU waits over the same interval, per
+      // frame: a frame with GPU near the frame time is GPU-bound; one with
+      // little GPU and little wait is CPU-bound (guest or encoding).
+      const uint64_t busy_ns = xe::gpu::metal::gpu_timing.busy_ns.load(std::memory_order_relaxed);
+      const uint64_t wait_ticks = xe::gpu::metal::gpu_timing.wait_ticks.load(std::memory_order_relaxed);
+      const uint64_t drawable_ticks = xe::ui::metal::drawable_wait_ticks.load(std::memory_order_relaxed);
+      const double gpu_ms = frames ? double(busy_ns - last_busy_ns) / 1e6 / frames : 0.0;
+      const double wait_ms = frames && tick_hz > 0 ? double(wait_ticks - last_wait_ticks) / tick_hz * 1e3 / frames : 0.0;
+      const double draw_ms = frames && tick_hz > 0 ? double(drawable_ticks - last_drawable_ticks) / tick_hz * 1e3 / frames : 0.0;
+      last_busy_ns = busy_ns;
+      last_wait_ticks = wait_ticks;
+      last_drawable_ticks = drawable_ticks;
       UILabel* l = g_fork_fps_label;
       if (!fps_owner.gameRunning) {
         l.hidden = YES;
@@ -701,12 +719,13 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
       const NSInteger th = [NSProcessInfo processInfo].thermalState;
       const char* th_name = (th >= 0 && th < 4) ? kThermal[th] : "?";
       CGRect safe = fps_owner.view.safeAreaLayoutGuide.layoutFrame;
-      l.frame = CGRectMake(safe.origin.x + 8, safe.origin.y + 6, 150, 20);
-      l.text = [NSString stringWithFormat:@"%.0f FPS · %s", fps, th_name];
+      l.frame = CGRectMake(safe.origin.x + 8, safe.origin.y + 6, 250, 20);
+      l.text = [NSString stringWithFormat:@"%.0f FPS · %s · GPU %.1f · wait %.1f ms", fps, th_name, gpu_ms, wait_ms];
       l.hidden = NO;
       [fps_owner.view bringSubviewToFront:l];
       if (++ticks % 10 == 0) {
-        XELOGI("[fps] {:.1f} fps, thermal {}, frame {}", fps, th_name, frame);
+        XELOGI("[fps] {:.1f} fps, thermal {}, frame {}, per frame: gpu busy {:.1f} ms, cp waits on gpu {:.1f} ms, drawable wait {:.1f} ms",
+               fps, th_name, frame, gpu_ms, wait_ms, draw_ms);
       }
     }];
   }
