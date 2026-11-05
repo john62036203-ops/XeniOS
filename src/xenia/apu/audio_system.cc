@@ -9,7 +9,10 @@
 
 #include "xenia/apu/audio_system.h"
 
+#include <atomic>
+#include <chrono>
 #include <limits>
+#include <thread>
 
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/audio_driver.h"
@@ -50,6 +53,37 @@ UPDATE_from_uint32(apu_max_queued_frames, 2024, 8, 31, 20, 64);
 // XeniOS 2.0.1's iOS default.
 UPDATE_from_uint32(apu_max_queued_frames, 2026, 11, 3, 14, 32);
 #endif  // XE_PLATFORM_IOS
+
+// fork diagnostic: what the audio worker is doing, logged from a side thread
+// every 2 s so a worker stuck inside the guest callback is still seen.
+namespace {
+std::atomic<uint64_t> g_ad_pumps{0}, g_ad_sem_drops{0}, g_ad_cb_begin{0}, g_ad_cb_end{0};
+std::atomic<uint64_t> g_ad_cb_max_us{0}, g_ad_cb_since_us{0}, g_ad_parked{0};
+std::atomic<bool> g_ad_started{false};
+uint64_t AdNowUs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+void AdStartWatch() {
+  if (g_ad_started.exchange(true)) return;
+  std::thread([] {
+    uint64_t last_end = 0;
+    for (int i = 0; i < 90; ++i) {   // ~3 minutes
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      const uint64_t b = g_ad_cb_begin.load(), e = g_ad_cb_end.load();
+      const uint64_t since = g_ad_cb_since_us.load();
+      const uint64_t in_cb_ms = (b > e && since) ? (AdNowUs() - since) / 1000 : 0;
+      XELOGI("[audio-diag] pumps={} sem_drops={} callbacks begun={} done={} (+{} in 2 s) "
+             "max_cb_ms={} in_callback_now_ms={} parked={} frame={}",
+             g_ad_pumps.load(), g_ad_sem_drops.load(), b, e, e - last_end,
+             g_ad_cb_max_us.load() / 1000, in_cb_ms, g_ad_parked.load(),
+             xe::logging::GetFrameNumber());
+      last_end = e;
+    }
+  }).detach();
+}
+}  // namespace
 
 namespace xe {
 namespace apu {
@@ -153,6 +187,7 @@ void AudioSystem::WorkerThreadMain() {
 
     // No clients yet: park until one registers or we're told to stop.
     if (client_index == kMaximumClientCount) {
+      g_ad_parked.fetch_add(1, std::memory_order_relaxed);
       xe::threading::Wait(pending_work_event_.get(), true);
       WaitWhilePaused();
       continue;
@@ -185,8 +220,10 @@ void AudioSystem::WorkerThreadMain() {
     if (xe::threading::Wait(client_semaphores_[client_index].get(), false,
                             std::chrono::milliseconds(0)) !=
         xe::threading::WaitResult::kSuccess) {
+      g_ad_sem_drops.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
+    g_ad_pumps.fetch_add(1, std::memory_order_relaxed);
 
     // UnregisterClient waits on this after clearing in_use.
     std::lock_guard<std::mutex> cb_lk(clients_[client_index].callback_mutex);
@@ -204,8 +241,16 @@ void AudioSystem::WorkerThreadMain() {
     if (client_callback) {
       SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
       uint64_t args[] = {client_callback_arg};
+      const uint64_t cb_t0 = AdNowUs();
+      g_ad_cb_since_us.store(cb_t0, std::memory_order_relaxed);
+      g_ad_cb_begin.fetch_add(1, std::memory_order_relaxed);
       processor_->Execute(worker_thread_->thread_state(), client_callback, args,
                           xe::countof(args));
+      const uint64_t cb_us = AdNowUs() - cb_t0;
+      uint64_t prev = g_ad_cb_max_us.load(std::memory_order_relaxed);
+      while (cb_us > prev && !g_ad_cb_max_us.compare_exchange_weak(prev, cb_us)) {
+      }
+      g_ad_cb_end.fetch_add(1, std::memory_order_relaxed);
     }
   }
   worker_running_ = false;
@@ -324,6 +369,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
 
   XELOGI("AudioSystem::RegisterClient: client {} registered successfully",
          index);
+  AdStartWatch();
 
   if (out_index) {
     *out_index = index;

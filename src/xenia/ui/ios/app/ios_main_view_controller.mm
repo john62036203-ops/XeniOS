@@ -52,6 +52,11 @@
 #import "xenia/ui/ios/game/ios_metal_view.h"
 #import "xenia/ui/ios/game/ios_launch_status.h"
 #import "xenia/ui/ios/game/ios_shader_compile_indicator.h"
+
+// fork: an on-screen frame counter (guest swaps per second, the "f:" number in
+// the log) and the thermal state, while a game runs.
+DEFINE_bool(ios_fps_overlay, true, "Show the game's frame rate on screen while it runs.", "iOS");
+static UILabel* g_fork_fps_label = nil;
 #import "xenia/ui/ios/launcher/ios_compat_data.h"
 #import "xenia/ui/ios/launcher/ios_compat_report_view_controller.h"
 #import "xenia/ui/ios/launcher/ios_content_management.h"
@@ -663,6 +668,48 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
   [self.view addGestureRecognizer:tap];
   in_game_menu_tap_recognizer_ = tap;
   [tap release];
+  if (cvars::ios_fps_overlay && !g_fork_fps_label) {
+    UILabel* label = [[UILabel alloc] initWithFrame:CGRectMake(8, 8, 190, 20)];
+    label.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
+    label.textColor = UIColor.whiteColor;
+    label.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+    label.layer.cornerRadius = 5;
+    label.layer.masksToBounds = YES;
+    label.textAlignment = NSTextAlignmentCenter;
+    label.userInteractionEnabled = NO;
+    label.hidden = YES;
+    [self.view addSubview:label];
+    g_fork_fps_label = label;   // kept for the app's lifetime
+    __block uint32_t last_frame = xe::logging::GetFrameNumber();
+    __block CFTimeInterval last_time = CACurrentMediaTime();
+    __block int ticks = 0;
+    XeniaViewController* fps_owner = self;
+    [NSTimer scheduledTimerWithTimeInterval:0.5
+                                    repeats:YES
+                                      block:^(NSTimer* timer) {
+      const uint32_t frame = xe::logging::GetFrameNumber();
+      const CFTimeInterval t = CACurrentMediaTime();
+      const double fps = t > last_time ? (frame - last_frame) / (t - last_time) : 0.0;
+      last_frame = frame;
+      last_time = t;
+      UILabel* l = g_fork_fps_label;
+      if (!fps_owner.gameRunning) {
+        l.hidden = YES;
+        return;
+      }
+      static const char* const kThermal[] = {"cool", "fair", "warm", "hot"};
+      const NSInteger th = [NSProcessInfo processInfo].thermalState;
+      const char* th_name = (th >= 0 && th < 4) ? kThermal[th] : "?";
+      CGRect safe = fps_owner.view.safeAreaLayoutGuide.layoutFrame;
+      l.frame = CGRectMake(safe.origin.x + 8, safe.origin.y + 6, 150, 20);
+      l.text = [NSString stringWithFormat:@"%.0f FPS · %s", fps, th_name];
+      l.hidden = NO;
+      [fps_owner.view bringSubviewToFront:l];
+      if (++ticks % 10 == 0) {
+        XELOGI("[fps] {:.1f} fps, thermal {}, frame {}", fps, th_name, frame);
+      }
+    }];
+  }
   [self updateJITStatusIndicator];
   [self updateJITAvailabilityUI];
   [self updateMemoryEntitlementStatusUI];
