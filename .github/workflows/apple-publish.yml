@@ -305,7 +305,7 @@ jobs:
       - resolve-metadata
     # The iOS 27 SDK is needed (crash reporter extension, StateReporting); the
     # macos-26 image tops out at Xcode 26.
-    runs-on: xcode-27
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
@@ -502,7 +502,8 @@ jobs:
     needs:
       - resolve-metadata
     # Same image as the iOS job, so both platforms build with the same Xcode.
-    runs-on: xcode-27
+    if: ${{ false }}   # fork: iOS only
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
