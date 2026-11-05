@@ -318,6 +318,8 @@ jobs:
         run: |
           set -euo pipefail
           xcode="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          # fork: GitHub's hosted images have no Xcode 27 yet; fall back to the newest Xcode 26
+          [ -n "${xcode}" ] || xcode="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
           if [ -z "${xcode}" ]; then
             echo "::error::No Xcode 27 on this runner:"
             ls -d /Applications/Xcode*.app || true
@@ -516,6 +518,8 @@ jobs:
         run: |
           set -euo pipefail
           xcode="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          # fork: GitHub's hosted images have no Xcode 27 yet; fall back to the newest Xcode 26
+          [ -n "${xcode}" ] || xcode="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
           if [ -z "${xcode}" ]; then
             echo "::error::No Xcode 27 on this runner:"
             ls -d /Applications/Xcode*.app || true
