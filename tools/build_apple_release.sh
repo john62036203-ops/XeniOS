@@ -854,7 +854,7 @@ if [ "$build_ios" -eq 1 ]; then
   echo ""
   echo "== iOS arm64 (CMake-built, ad-hoc-signed ipa) =="
 
-  cmake --build "$ios_build_dir" --config "$buildcfg" --target xenia-app
+  cmake --build "$ios_build_dir" --config "$buildcfg" --target xenia-app -- -k 0
 
   ios_dir="$ios_build_dir/bin/iOS/$buildcfg"
   app_bundle="$(find_first_app "$ios_dir")" || die "iOS app not found in $ios_dir"

@@ -217,9 +217,13 @@ target_compile_options(xenia-ui-ios PRIVATE
 )
 
 # StateReporting (ios_state_reporting.mm) is new in iOS 27; the app runs on 26.
-target_link_options(xenia-ui-ios PUBLIC
-  "SHELL:-weak_framework StateReporting"
-)
+execute_process(COMMAND xcrun --sdk iphoneos --show-sdk-path
+                OUTPUT_VARIABLE XE_IOS_SDK_PATH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(EXISTS "${XE_IOS_SDK_PATH}/System/Library/Frameworks/StateReporting.framework")
+  target_link_options(xenia-ui-ios PUBLIC
+    "SHELL:-weak_framework StateReporting"
+  )
+endif()
 
 target_link_libraries(xenia-ui-ios PUBLIC
   xenia-base

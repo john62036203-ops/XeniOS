@@ -11,9 +11,15 @@
 
 #import <Foundation/Foundation.h>
 // Weak-linked: the framework is new in iOS 27, the app runs on 26.
+#if __has_include(<StateReporting/StateReporting.h>)
 #import <StateReporting/StateReporting.h>
+#define XE_HAS_STATE_REPORTING 1
+#endif
 
 void xe_ios_state_reporting_note_title(uint32_t title_id) {
+#if !defined(XE_HAS_STATE_REPORTING)
+  (void)title_id;   // fork: built with an SDK older than iOS 27
+#else
   if (@available(iOS 27.0, *)) {
     @autoreleasepool {
       // Rare (a game starting or ending), far below the rate limit.
@@ -29,4 +35,5 @@ void xe_ios_state_reporting_note_title(uint32_t title_id) {
                             volatileMetadata:nil];
     }
   }
+#endif
 }
