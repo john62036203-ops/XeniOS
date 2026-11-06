@@ -23,11 +23,13 @@
 #include <unistd.h>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <ctime>
 #include <limits>
 #include <memory>
+#include <thread>
 
 #if defined(__GLIBCXX__)
 #include <cxxabi.h>
@@ -795,6 +797,38 @@ class PosixCondition<Event> : public PosixConditionBase {
   }
 
   void Reset() {
+    auto lock = std::unique_lock(mutex_);
+    signal_ = false;
+  }
+
+  // fork: a pulse held for 10us is lost on a waiter that is not scheduled in
+  // time, and always on a WaitMultiple waiter, which re-polls every 1ms (Ninja
+  // Gaiden II's audio callback blocked forever on one). With a waiter present,
+  // hold it until an auto-reset waiter consumes it, at most 2ms.
+  void Pulse() {
+    using namespace std::chrono_literals;
+    bool waiters;
+    {
+      auto lock = std::unique_lock(mutex_);
+      signal_ = true;
+      waiters = parked_waiters_ != 0 ||
+                multi_wait_refs_.load(std::memory_order_acquire) != 0;
+      NotifyAll();
+    }
+    if (waiters) {
+      const auto deadline = std::chrono::steady_clock::now() + 2ms;
+      while (std::chrono::steady_clock::now() < deadline) {
+        {
+          auto lock = std::unique_lock(mutex_);
+          if (!signal_) {
+            return;  // an auto-reset waiter took it
+          }
+        }
+        std::this_thread::sleep_for(50us);
+      }
+    } else {
+      std::this_thread::sleep_for(10us);
+    }
     auto lock = std::unique_lock(mutex_);
     signal_ = false;
   }
@@ -1682,13 +1716,7 @@ class PosixEvent final : public PosixConditionHandle<Event> {
     assert_always();
     return result;
   }
-  void Pulse() override {
-    using namespace std::chrono_literals;
-    handle_.Signal();
-    MaybeYield();
-    Sleep(10us);
-    handle_.Reset();
-  }
+  void Pulse() override { handle_.Pulse(); }
 };
 
 std::unique_ptr<Event> Event::CreateManualResetEvent(bool initial_state) {
