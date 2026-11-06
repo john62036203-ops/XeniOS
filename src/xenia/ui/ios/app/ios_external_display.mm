@@ -173,6 +173,8 @@ void PostHostDidChange() {
 @end
 
 NSObject* XeniaExternalDisplayRegisterSceneAccessory(UIViewController* view_controller) {
+  // fork: scene accessories are iOS 27 SDK API; the fork builds with Xcode 26.
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
   if (@available(iOS 27.0, *)) {
     UISceneConfiguration* configuration = [[[UISceneConfiguration alloc]
         initWithName:@"External Display"
@@ -185,6 +187,7 @@ NSObject* XeniaExternalDisplayRegisterSceneAccessory(UIViewController* view_cont
     registration.enabled = YES;
     return [registration retain];
   }
+#endif
   return nil;
 }
 
