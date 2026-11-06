@@ -19,11 +19,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 
-DEFINE_string(ios_controller_face_buttons, "auto",
-              "How a physical controller's A/B/X/Y reach the game: position (as iOS "
-              "reports them), label (by printed letter, swapping A/B and X/Y), or auto "
-              "(label on Nintendo-layout pads, position otherwise).",
-              "iOS");
+DECLARE_string(ios_controller_face_buttons);
 
 #import "xenia/ui/ios/settings/ios_log_view_controller.h"
 #import "xenia/ui/ios/shared/ios_alert_actions.h"

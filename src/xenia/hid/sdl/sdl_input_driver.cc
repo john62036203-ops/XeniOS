@@ -67,6 +67,13 @@ void QuitSDLGamepadOnMainThread() {
 #endif  // XE_PLATFORM_IOS
 
 // TODO(joellinn) make this path relative to the config folder.
+// fork: Nintendo-layout pads print A/B and X/Y swapped relative to Xbox; SDL
+// reports face buttons by position, so map by SDL's printed label instead.
+DEFINE_string(ios_controller_face_buttons, "auto",
+              "How a physical controller's A/B/X/Y reach the game: position (as the "
+              "pad reports them), label (by printed letter, swapping A/B and X/Y), or "
+              "auto (by printed label when the pad reports A/B/X/Y labels).",
+              "HID");
 DEFINE_path(mappings_file, "",
             "Filename of a database with custom game controller mappings. "
             "Empty uses the bundled SDL_GameControllerDB.",
@@ -919,6 +926,35 @@ void SDLInputDriver::OnControllerDeviceButtonChanged(const SDL_Event& event) {
     return;
   }
   auto xbutton = xbutton_lookup.at(event.gbutton.button);
+  if (event.gbutton.button <= SDL_GAMEPAD_BUTTON_NORTH &&
+      cvars::ios_controller_face_buttons != "position") {
+    // fork: face buttons by printed label.
+    const SDL_GamepadButtonLabel label = SDL_GetGamepadButtonLabel(
+        controller.sdl, static_cast<SDL_GamepadButton>(event.gbutton.button));
+    uint16_t by_label = 0;
+    switch (label) {
+      case SDL_GAMEPAD_BUTTON_LABEL_A: by_label = X_INPUT_GAMEPAD_A; break;
+      case SDL_GAMEPAD_BUTTON_LABEL_B: by_label = X_INPUT_GAMEPAD_B; break;
+      case SDL_GAMEPAD_BUTTON_LABEL_X: by_label = X_INPUT_GAMEPAD_X; break;
+      case SDL_GAMEPAD_BUTTON_LABEL_Y: by_label = X_INPUT_GAMEPAD_Y; break;
+      default: break;
+    }
+    if (cvars::ios_controller_face_buttons == "label" && !by_label) {
+      // No letter labels reported: assume a Nintendo layout.
+      static const uint16_t kNintendo[4] = {X_INPUT_GAMEPAD_B, X_INPUT_GAMEPAD_A,
+                                            X_INPUT_GAMEPAD_Y, X_INPUT_GAMEPAD_X};
+      by_label = kNintendo[event.gbutton.button];
+    }
+    if (by_label) {
+      static bool logged = false;
+      if (!logged && by_label != xbutton) {
+        logged = true;
+        XELOGI("SDL HID: face buttons mapped by printed label ({})",
+               SDL_GetGamepadName(controller.sdl) ? SDL_GetGamepadName(controller.sdl) : "?");
+      }
+      xbutton = by_label;
+    }
+  }
   // Pressed or released?
   if (event.gbutton.down) {
     xbuttons |= xbutton;
