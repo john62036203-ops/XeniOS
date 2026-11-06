@@ -23,7 +23,7 @@ Options:
                        Configured macOS arm64 CMake build tree; builds and
                        packages xenios_macos_apple_silicon.dmg from it
   --skip-ios           Don't build the IPA
-  --version VERSION    Marketing version override (defaults to latest vX.Y.Z tag, then 2.2)
+  --version VERSION    Marketing version override (defaults to latest vX.Y.Z tag, then 2.2.4)
   --build-number NUM   Build number override (defaults to git commit count)
   --channel NAME       release|preview (default: release)
   --stage NAME         alpha|beta|rc|stable (default: stable)
@@ -58,11 +58,16 @@ Notes:
 - The Mac app ships as XeniOS.app (com.xenios), ad-hoc signed. The CMake build
   keeps its Xenia-edge name; the package is renamed.
 - Marketing version defaults to the latest reachable vX.Y.Z git tag.
-- If no matching tag is available, the marketing version falls back to 2.2.
+- If no matching tag is available, the marketing version falls back to 2.2.4.
 - Public release stage defaults to stable.
 - Official build numbers default to git rev-list --count HEAD.
-- The crash symbol map for the diagnostics Worker is written to
-  OUT/symbols/<UUID>.map.gz; upload it with the release.
+- The crash symbols for the diagnostics Worker are written to
+  OUT/symbols/symbols-<UUID>.bin (function names, inlined frames and file:line;
+  tools/ios/make_symbol_map.sh, about two minutes). Attach it to the release
+  with the IPA: the Worker pulls what it needs from there. Line tables need the
+  object files the linker used: with ThinLTO configure the build with
+  -DCMAKE_EXE_LINKER_FLAGS=-Wl,-object_path_lto,<dir> (the publish workflow
+  does); XENIOS_SKIP_SYMBOLS=1 skips this step.
 USAGE
 }
 
@@ -101,7 +106,7 @@ trim_string() {
 }
 
 default_marketing_version() {
-  printf '%s' "2.2"
+  printf '%s' "2.2.4"
 }
 
 validate_marketing_version() {
@@ -865,7 +870,9 @@ if [ "$build_ios" -eq 1 ]; then
     plist_set_string "$(bundle_plist_path "$app_bundle")" "XeniOSDiagnosticsURL" "$diagnostics_url"
   fi
   # The map the diagnostics Worker symbolicates this build's crash frames with.
-  "$root/tools/ios/make_symbol_map.sh" "$app_bundle" "$out_dir/symbols"
+  if [ -z "${XENIOS_SKIP_SYMBOLS:-}" ]; then
+    "$root/tools/ios/make_symbol_map.sh" "$app_bundle" "$out_dir/symbols" "$root"
+  fi
   # Not compile_bundle_icon_assets: in this tree the CMake build already compiled the whole
   # asset catalog (alternate icons, launch color, settings images) into the bundle, and
   # recompiling only the app icon would drop the rest.

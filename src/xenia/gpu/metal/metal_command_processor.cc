@@ -100,6 +100,11 @@ DEFINE_int32(
     "explicitly (up to the number of logical CPU cores), 0 to disable "
     "multithreaded compilation.",
     "Metal");
+DEFINE_bool(
+    metal_log_frame_gpu_waits, false,
+    "Log, at every swap, the time the CPU spent waiting for the GPU in the "
+    "frame by reason, and the command buffers it created by kind.",
+    "Metal");
 
 namespace xe {
 namespace gpu {
@@ -333,6 +338,17 @@ const char* const kCommandBufferKindNames[] = {
 static_assert(std::size(kCommandBufferKindNames) ==
                   size_t(MetalCommandProcessor::CommandBufferKind::kCount),
               "Command buffer kind names must match the enum");
+
+// Indexed by GpuWaitReason.
+const char* const kGpuWaitReasonNames[] = {
+    "memexport",      "zpd_query",           "shader_done_fence",
+    "trace_playback", "uniforms",            "resolve",
+    "texture_upload", "scaled_resolve_copy", "snapshot",
+    "dump",           "resolve_before_guest_read",
+};
+static_assert(std::size(kGpuWaitReasonNames) ==
+                  size_t(MetalCommandProcessor::GpuWaitReason::kCount),
+              "GPU wait reason names must match the enum");
 
 int64_t GetSteadyTimeNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -913,17 +929,58 @@ MetalCommandProcessor::EnsureTranslationSpirv(
   return ShaderCompileStatus::kReady;
 }
 
-bool MetalCommandProcessor::CompileHostShader(Shader::Translation* translation,
-                                              bool is_ios) {
+bool MetalCommandProcessor::CompileHostShader(
+    Shader::Translation* translation, bool is_ios,
+    std::vector<uint8_t>* metallib_out) {
   if (!translation) {
     return false;
   }
   if (UseDxilPath()) {
     return static_cast<DxilShader::DxilTranslation*>(translation)
-        ->CompileToAir(device_, metal_shader_converter_);
+        ->CompileToAir(device_, metal_shader_converter_, metallib_out);
   }
   return static_cast<MslShader::MslTranslation*>(translation)
       ->CompileToMsl(device_, is_ios);
+}
+
+MetalCommandProcessor::ShaderCompileStatus
+MetalCommandProcessor::TranslateAndCompileHostShader(
+    Shader::Translation* translation, SpirvShaderTranslator& translator,
+    bool is_ios) {
+  if (!translation) {
+    return ShaderCompileStatus::kFailed;
+  }
+  // Shader dumps and bisection want the translation itself.
+  const bool cacheable = UseDxilPath() && cvars::dump_shaders.empty() &&
+                         shader_library_cache_.is_open();
+  // Translated even when the library is on disk: translating sets the
+  // shader's texture and sampler bindings that draws bind from.
+  ShaderCompileStatus status = EnsureTranslationSpirv(translation, translator);
+  if (status != ShaderCompileStatus::kReady) {
+    return status;
+  }
+  MetalShaderLibraryCache::Key key;
+  if (cacheable) {
+    key = MetalShaderLibraryCache::MakeKey(*translation);
+    MetalShaderLibraryCache::Entry entry;
+    if (shader_library_cache_.Find(key, entry) &&
+        static_cast<DxilShader::DxilTranslation*>(translation)
+            ->LoadMetallib(device_, entry.metallib, entry.entry_point_name)) {
+      return ShaderCompileStatus::kReady;
+    }
+  }
+  std::vector<uint8_t> metallib;
+  if (!CompileHostShader(translation, is_ios,
+                         cacheable ? &metallib : nullptr)) {
+    return ShaderCompileStatus::kFailed;
+  }
+  if (cacheable && !metallib.empty()) {
+    shader_library_cache_.Store(
+        key, metallib,
+        static_cast<DxilShader::DxilTranslation*>(translation)
+            ->entry_point_name());
+  }
+  return ShaderCompileStatus::kReady;
 }
 
 void MetalCommandProcessor::NoteShaderCompileFailed(
@@ -1045,11 +1102,8 @@ Shader::Translation* MetalCommandProcessor::GetOrCreateHostTranslation(
             shader.type() == xenos::ShaderType::kVertex ? 2 : 1)) {
       status = ShaderCompileStatus::kPending;
     } else {
-      status = EnsureTranslationSpirv(translation, *spirv_shader_translator_);
-      if (status == ShaderCompileStatus::kReady &&
-          !CompileHostShader(translation, kIsIos)) {
-        status = ShaderCompileStatus::kFailed;
-      }
+      status = TranslateAndCompileHostShader(translation,
+                                             *spirv_shader_translator_, kIsIos);
       if (status == ShaderCompileStatus::kFailed) {
         NoteShaderCompileFailed(translation);
       }
@@ -1198,10 +1252,17 @@ MTL::Function* MetalCommandProcessor::GetSpecializedFunction(
                              NS::UTF8StringEncoding));
     }
   }
+  // Through the title's pipeline archive, which keeps the specialized function
+  // for the next launch.
+  MTL::FunctionDescriptor* function_desc =
+      MTL::FunctionDescriptor::alloc()->init();
+  function_desc->setName(
+      NS::String::string(function_name.c_str(), NS::UTF8StringEncoding));
+  function_desc->setConstantValues(values);
   NS::Error* error = nullptr;
-  MTL::Function* function = library->newFunction(
-      NS::String::string(function_name.c_str(), NS::UTF8StringEncoding), values,
-      &error);
+  MTL::Function* function =
+      pipeline_archive_.NewFunction(library, function_desc, &error);
+  function_desc->release();
   values->release();
   if (!function) {
     if (error_out) {
@@ -1488,7 +1549,7 @@ MTL::RenderPipelineState* MetalCommandProcessor::CreatePipelineState(
 
   NS::Error* error = nullptr;
   MTL::RenderPipelineState* pipeline =
-      device_->newRenderPipelineState(desc, &error);
+      pipeline_archive_.NewRenderPipelineState(device_, desc, &error);
   desc->release();
 
   if (!pipeline && error_out && error) {
@@ -1851,12 +1912,11 @@ void MetalCommandProcessor::AsyncCompileThread(size_t thread_index) {
     } else {
       ShaderCompileStatus translation_status =
           shader_request.translation
-              ? EnsureTranslationSpirv(shader_request.translation,
-                                       *worker_translator)
+              ? TranslateAndCompileHostShader(shader_request.translation,
+                                              *worker_translator,
+                                              shader_request.is_ios)
               : ShaderCompileStatus::kFailed;
-      bool compiled =
-          translation_status == ShaderCompileStatus::kReady &&
-          CompileHostShader(shader_request.translation, shader_request.is_ios);
+      bool compiled = translation_status == ShaderCompileStatus::kReady;
       // Nothing queues a translation twice and the draw thread only translates
       // one that is not queued, so losing the claim here shouldn't happen.
       // Leave it unqueued for a later draw to retry rather than fail it
@@ -1906,7 +1966,9 @@ void MetalCommandProcessor::TracePlaybackWillWriteMemory(uint32_t base_ptr,
       hazards->HasPendingAccess(base_ptr, length)) {
     // Submission alone does not keep the GPU from seeing a later CPU restore.
     // Consume this recorded version before overwriting aliased guest RAM.
+    int64_t wait_start_ns = GetSteadyTimeNs();
     AwaitAllQueueOperationsCompletion();
+    NoteGpuWait(GpuWaitReason::kTracePlayback, wait_start_ns);
   }
 }
 
@@ -2070,7 +2132,9 @@ bool MetalCommandProcessor::TryWriteShaderDoneFence(uint32_t address,
   }
   // Trace records read guest RAM immediately. Allocation failure also needs a
   // safe CPU fallback: never report completion while the GPU still uses RAM.
+  int64_t wait_start_ns = GetSteadyTimeNs();
   AwaitAllQueueOperationsCompletion();
+  NoteGpuWait(GpuWaitReason::kShaderDoneFence, wait_start_ns);
   return false;
 }
 
@@ -2084,6 +2148,7 @@ void MetalCommandProcessor::EncodeDeferredShaderDoneFences() {
   NS::UInteger source_offset = 0;
   MTL::BlitCommandEncoder* encoder = nullptr;
   if (AcquireSpirvArgumentBufferSlice(size, 16, &source, &source_offset)) {
+    EndSharedComputeEncoder();
     encoder = current_command_buffer_->blitCommandEncoder();
   }
   if (encoder) {
@@ -2114,7 +2179,9 @@ void MetalCommandProcessor::EncodeDeferredShaderDoneFences() {
     // submission end cannot re-enter fence encoding without an active encoder.
     XELOGE("Metal: couldn't encode shader-done fence writes, waiting for GPU");
     assert_null(current_render_encoder_);
+    int64_t wait_start_ns = GetSteadyTimeNs();
     AwaitAllQueueOperationsCompletion();
+    NoteGpuWait(GpuWaitReason::kShaderDoneFence, wait_start_ns);
     for (size_t i = 0; i < pending_shader_done_fence_ranges_.size(); ++i) {
       std::memcpy(
           memory_->TranslatePhysical(
@@ -2299,6 +2366,16 @@ bool MetalCommandProcessor::SetupContext() {
     XELOGE("MetalCommandProcessor: No Metal device or command queue available");
     return false;
   }
+
+  MTL::CaptureManager* capture_manager =
+      MTL::CaptureManager::sharedCaptureManager();
+  debug_labels_ =
+      (capture_manager &&
+       (capture_manager->supportsDestination(
+            MTL::CaptureDestinationDeveloperTools) ||
+        capture_manager->supportsDestination(
+            MTL::CaptureDestinationGPUTraceDocument))) ||
+      std::getenv("MTL_DEBUG_LAYER");
 
   wait_shared_event_ = device_->newSharedEvent();
   if (wait_shared_event_) {
@@ -2637,6 +2714,30 @@ void MetalCommandProcessor::PrepareForWait() {
   CommandProcessor::PrepareForWait();
 }
 
+uint64_t MetalCommandProcessor::GetHeldGpuWritesSubmission() {
+  // Resolve output, with zero-copy. Command processor stores aren't held: a
+  // late held store could overwrite a newer guest write (a read-through
+  // variant hung BF4 on a spin at 0x1FC1B002).
+  return resolve_last_submission_ > GetCompletedSubmission()
+             ? resolve_last_submission_
+             : 0;
+}
+
+void MetalCommandProcessor::AwaitGpuWritesBeforeGuestRead() {
+  // Export output that isn't awaited is left unordered here, as in D3D12 and
+  // Vulkan.
+  if (resolve_last_submission_ <= GetCompletedSubmission()) {
+    return;
+  }
+  int64_t wait_start_ns = GetSteadyTimeNs();
+  if (resolve_last_submission_ >= submission_current_ &&
+      current_command_buffer_) {
+    EndCommandBuffer(CommandBufferKind::kSubmissionWait);
+  }
+  AwaitSubmissionCompletion(resolve_last_submission_);
+  NoteGpuWait(GpuWaitReason::kResolveBeforeGuestRead, wait_start_ns);
+}
+
 void MetalCommandProcessor::PollCompletedSubmission() {
   ProcessCompletedSubmissions();
   PumpQueryResolves();
@@ -2676,6 +2777,7 @@ void MetalCommandProcessor::ShutdownContext() {
 
   // Submit and wait for any pending command buffer
   if (current_command_buffer_) {
+    EndSharedComputeEncoder();
     uint64_t wait_value = 0;
     if (wait_shared_event_) {
       wait_value = ++wait_shared_event_value_;
@@ -2689,8 +2791,11 @@ void MetalCommandProcessor::ShutdownContext() {
     ScheduleSpirvArgumentBufferRelease(current_command_buffer_);
     current_command_buffer_->commit();
     if (wait_shared_event_) {
-      wait_shared_event_->waitUntilSignaledValue(
-          wait_value, std::numeric_limits<uint64_t>::max());
+      // Bounded so a GPU that has stopped (in the background) can't hold up
+      // quitting. The command buffer keeps what it uses alive.
+      if (!wait_shared_event_->waitUntilSignaledValue(wait_value, 2000)) {
+        XELOGW("Metal: the last command buffer didn't finish in 2 s at shutdown");
+      }
     } else {
       current_command_buffer_->waitUntilCompleted();
     }
@@ -2791,6 +2896,12 @@ void MetalCommandProcessor::ShutdownContext() {
 
   ShutdownAsyncCompilation();
   storage_writer_.ShutdownShaderStorage();
+  // Not saved here: a save takes seconds, and quitting the app may not wait for
+  // it. What was added since the last save is compiled again next time.
+  pipeline_archive_.CancelSave();
+  JoinPipelineArchiveSave();
+  pipeline_archive_.Close(false);
+  shader_library_cache_.Close();
   if (exact_float_depth_bias_library_) {
     exact_float_depth_bias_library_->release();
     exact_float_depth_bias_library_ = nullptr;
@@ -3074,6 +3185,34 @@ void MetalCommandProcessor::InitializeShaderStorage(
   config.version = PipelineDescription::kVersion +
                    SpirvShaderTranslator::Modification::kVersion;
 
+  // What the stored shaders and pipelines were built into last time, so they
+  // load instead of being built again (see MetalShaderLibraryCache and
+  // MetalPipelineArchive).
+  JoinPipelineArchiveSave();
+  {
+    const std::filesystem::path title_local_root =
+        GetShaderStorageLocalRoot(cache_root) / "metal" /
+        fmt::format("{:08X}", title_id);
+    // Both are discarded when the build or the translation settings change:
+    // the libraries, and the pipelines' functions, are made by this build.
+    const std::string fingerprint = MetalShaderLibraryCache::MakeFingerprint(
+        fmt::format("{} device={} msaa2x={} scale={}x{}",
+                    UseDxilPath() ? "dxil" : "msl",
+                    device_->name() ? device_->name()->utf8String() : "",
+                    spirv_translator_native_2x_msaa_,
+                    spirv_translator_resolution_scale_x_,
+                    spirv_translator_resolution_scale_y_));
+    if (UseDxilPath()) {
+      shader_library_cache_.Open(title_local_root / "shader_libraries.bin",
+                                 fingerprint);
+    } else {
+      shader_library_cache_.Close();
+    }
+    pipeline_archive_.Open(device_, title_local_root / "pipelines",
+                           fingerprint);
+    archive_saved_ticks_ = xe::Clock::QueryHostTickCount();
+  }
+
   std::vector<PipelineStoredDescription> stored_descriptions;
   if (!storage_writer_.InitializeShaderStorage(
           cache_root, title_id, config,
@@ -3146,6 +3285,7 @@ void MetalCommandProcessor::InitializeShaderStorage(
   {
     // Everything may already be done, with no later finish to notice it.
     std::lock_guard<std::mutex> lock(async_compile_mutex_);
+    EndStorageLoadingIfDoneLocked();
     storage_stats_queued_all_ = true;
     if (storage_stats_pending_ && storage_stats_keys_.empty()) {
       RecordStorageRebuildStatsLocked();
@@ -3174,6 +3314,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   SCOPE_profile_cpu_f("gpu");
   EndZPDFrame();
   ProcessCompletedSubmissions();
+  LogFrameGpuWaits();
 
   // Completion handlers land a frame or two behind, which a window this wide
   // absorbs.
@@ -3431,6 +3572,20 @@ void MetalCommandProcessor::RecordStorageRebuildStatsLocked() {
 
 void MetalCommandProcessor::CountAsyncCompileTaskFinishedLocked() {
   compile_activity.finished.fetch_add(1, std::memory_order_relaxed);
+  EndStorageLoadingIfDoneLocked();
+}
+
+void MetalCommandProcessor::EndStorageLoadingIfDoneLocked() {
+  // The stored pipelines' rebuild is over once the compile threads have
+  // finished as many tasks as were queued by its end (the test the shader
+  // indicator uses). Until then the pipeline archive isn't saved.
+  const uint64_t queued_end =
+      compile_activity.storage_queued_end.load(std::memory_order_relaxed);
+  if (queued_end &&
+      compile_activity.storage_loading.load(std::memory_order_relaxed) &&
+      compile_activity.finished.load(std::memory_order_relaxed) >= queued_end) {
+    compile_activity.storage_loading = false;
+  }
 }
 
 void MetalCommandProcessor::NoteStoredPipelineDoneLocked(
@@ -3709,6 +3864,71 @@ void MetalCommandProcessor::AwaitSubmissionCompletion(uint64_t submission) {
                                   std::memory_order_relaxed);
 }
 
+void MetalCommandProcessor::NoteGpuWait(GpuWaitReason reason,
+                                        int64_t wait_start_ns) {
+  frame_gpu_wait_ns_[size_t(reason)] += GetSteadyTimeNs() - wait_start_ns;
+  ++frame_gpu_wait_counts_[size_t(reason)];
+}
+
+void MetalCommandProcessor::CommitAndAwait(MTL::CommandBuffer* command_buffer,
+                                            GpuWaitReason reason) {
+  EndSharedComputeEncoder(command_buffer);
+  command_buffer->commit();
+  int64_t wait_start_ns = GetSteadyTimeNs();
+  command_buffer->waitUntilCompleted();
+  NoteGpuWait(reason, wait_start_ns);
+}
+
+void MetalCommandProcessor::LogFrameGpuWaits() {
+  int64_t now_ns = GetSteadyTimeNs();
+  if (cvars::metal_log_frame_gpu_waits) {
+    uint64_t wait_ns = 0;
+    std::string waits;
+    for (size_t i = 0; i < kGpuWaitReasonCount; ++i) {
+      wait_ns += frame_gpu_wait_ns_[i];
+      if (frame_gpu_wait_counts_[i]) {
+        waits += fmt::format(" {}={:.2f}ms/{}", kGpuWaitReasonNames[i],
+                             frame_gpu_wait_ns_[i] * 1e-6,
+                             frame_gpu_wait_counts_[i]);
+      }
+    }
+    uint64_t command_buffers = 0;
+    std::string kinds;
+    for (size_t i = 0; i < kCommandBufferKindCount; ++i) {
+      uint64_t count =
+          command_buffer_kind_counts_[i] - command_buffer_kind_frame_start_[i];
+      command_buffers += count;
+      if (count) {
+        kinds += fmt::format(" {}={}", kCommandBufferKindNames[i], count);
+      }
+    }
+    XELOGI(
+        "Metal: frame {}: {:.2f} ms, {:.2f} ms waiting for the GPU{}; {} "
+        "command buffer(s){}",
+        frame_current_,
+        frame_log_start_ns_ ? (now_ns - frame_log_start_ns_) * 1e-6 : 0.0,
+        wait_ns * 1e-6, waits, command_buffers, kinds);
+  }
+  std::fill(std::begin(frame_gpu_wait_ns_), std::end(frame_gpu_wait_ns_), 0);
+  std::fill(std::begin(frame_gpu_wait_counts_),
+            std::end(frame_gpu_wait_counts_), 0);
+  std::copy(std::begin(command_buffer_kind_counts_),
+            std::end(command_buffer_kind_counts_),
+            command_buffer_kind_frame_start_);
+  frame_log_start_ns_ = now_ns;
+}
+
+void MetalCommandProcessor::AwaitMemexportSubmission(uint64_t submission) {
+  int64_t wait_start_ns = GetSteadyTimeNs();
+  // submission_current_ is committed once there's no command buffer open, and
+  // completions arrive in order.
+  if (submission >= submission_current_ && current_command_buffer_) {
+    EndCommandBuffer(CommandBufferKind::kSubmissionWait);
+  }
+  AwaitSubmissionCompletion(submission);
+  NoteGpuWait(GpuWaitReason::kMemexport, wait_start_ns);
+}
+
 void MetalCommandProcessor::AwaitAllQueueOperationsCompletion() {
   // Ending first, so a memexport draw that is still only recorded gets
   // submitted rather than waited past.
@@ -3805,7 +4025,9 @@ CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenQuery(
         XELOGI("ZPD: Stall awaiting submission={} completed_before={}",
                wait_for, completed_submission);
       }
+      int64_t wait_start_ns = GetSteadyTimeNs();
       AwaitSubmissionCompletion(wait_for);
+      NoteGpuWait(GpuWaitReason::kZpdQuery, wait_start_ns);
       waited_for_submission = true;
       PumpQueryResolves();
       is_pool_exhausted = !zpd_visibility_pool_->has_free_indices();
@@ -3935,7 +4157,9 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
   }
 
   if (wait_for_submission > GetCompletedSubmission()) {
+    int64_t wait_start_ns = GetSteadyTimeNs();
     AwaitSubmissionCompletion(wait_for_submission);
+    NoteGpuWait(GpuWaitReason::kZpdQuery, wait_start_ns);
   }
 
   PumpQueryResolves();
@@ -4085,7 +4309,7 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       DrawOverlapsPendingWrites(render_encoder_tile_resolve_ranges_,
                                 *vertex_shader, pixel_shader, index_buffer_info,
                                 vertex_indices)) {
-    XELOGI("tresolve: end rsvread");
+    XELOGD("tresolve: end rsvread");
     EndRenderEncoder();
   }
   render_encoder_index_count_ += index_count;
@@ -6117,13 +6341,11 @@ bool MetalCommandProcessor::IssueDrawDxil(
                 normalized_depth_control, normalized_color_mask)
           : SpirvShaderTranslator::Modification(0);
 
-  // Memory exports are guest-visible writes. A pending generic pipeline,
-  // including after a profile guard miss, must never skip the export draw.
-  // Counted draws also require the guest's exact kills and alpha test.
+  // A counted draw needs the guest's own shaders. The placeholder has no pixel
+  // kills or alpha test and overcounts, and a skipped draw counts nothing.
   const bool exact_shaders_required =
-      memexport_used ||
-      (GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
-       zpd_current_report_.handle != kInvalidReportHandle);
+      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_current_report_.handle != kInvalidReportHandle;
 
   ShaderCompileStatus compile_status = ShaderCompileStatus::kReady;
   ShaderCompileStatus pixel_status = ShaderCompileStatus::kReady;
@@ -6464,7 +6686,7 @@ bool MetalCommandProcessor::IssueCopy() {
   if (!render_target_cache_) {
     EndRenderEncoder();
   } else if (!current_render_encoder_) {
-    XELOGI("tresolve: fallback no_pass");
+    XELOGD("tresolve: fallback no_pass");
   }
   MTL::CommandBuffer* copy_command_buffer = EnsureCommandBuffer();
   if (!copy_command_buffer) {
@@ -6501,6 +6723,11 @@ bool MetalCommandProcessor::IssueCopy() {
 
   // The resolve overwrote any export output here, so no fence need await it.
   ClearMemexportPages(written_address, written_length);
+  // With zero-copy the resolve writes guest RAM itself, which the guest may
+  // read once a fence or interrupt tells it the GPU got past the resolve.
+  if (shared_memory_->is_zero_copy()) {
+    resolve_last_submission_ = submission_current_;
+  }
 
   // Later work in the submission that reads the output (draws, texture loads
   // encoded into the same command buffer) is ordered after the resolve on the
@@ -6725,8 +6952,10 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
     return nullptr;
   }
   current_command_buffer_->retain();
-  current_command_buffer_->setLabel(
-      NS::String::string("XeniaCommandBuffer", NS::UTF8StringEncoding));
+  if (debug_labels_) {
+    current_command_buffer_->setLabel(
+        NS::String::string("XeniaCommandBuffer", NS::UTF8StringEncoding));
+  }
   command_buffer_render_passes_ = 0;
 
   if (!UseDxilPath() && !EnsureSpirvUniformBuffer()) {
@@ -6849,6 +7078,7 @@ void MetalCommandProcessor::ResetMslRenderEncoderStateCache() {
   msl_depth_stencil_state_ = nullptr;
   msl_stencil_reference_valid_ = false;
   msl_stencil_reference_ = 0;
+  render_encoder_buffers_ = {};
   ff_blend_factor_valid_ = false;
   ResetRenderEncoderResourceUsage();
 }
@@ -6877,10 +7107,13 @@ void MetalCommandProcessor::InvalidateRenderEncoderStateAfterDrawPassTransfers(
   if (mutations & RTC::kDrawPassTransferEncoderMutationRasterizer) {
     msl_rasterizer_state_valid_ = false;
   }
-  // The DXIL binder rebinds its own buffer slots on every draw, so only the
-  // MSL path's bindings need dropping: shared memory sits at buffer slot 0 and
-  // the constant buffers from slot 1, both stages, and its textures start at
-  // fragment texture 0.
+  // Transfer draws through the DXIL path bind their own descriptor heap and
+  // argument buffer at the Metal Shader Converter's bind points, which the mask
+  // doesn't name.
+  render_encoder_buffers_ = {};
+  // For the MSL path, shared memory sits at buffer slot 0 and the constant
+  // buffers from slot 1, both stages, and its textures start at fragment
+  // texture 0.
   if (mutations & (RTC::kDrawPassTransferEncoderMutationVertexSlot0 |
                    RTC::kDrawPassTransferEncoderMutationFragmentSlot0)) {
     msl_bound_shared_memory_buffer_ = nullptr;
@@ -6917,8 +7150,43 @@ void MetalCommandProcessor::ResetMslCrossEncoderReuseCaches() {
   msl_last_argbuf_pixel_layout_uid_ = 0;
 }
 
+MTL::ComputeCommandEncoder* MetalCommandProcessor::BeginSharedComputeEncoder(
+    MTL::CommandBuffer* command_buffer,
+    MetalBufferHazards::Encoder** hazards_out) {
+  if (!command_buffer || command_buffer != current_command_buffer_) {
+    return nullptr;
+  }
+  if (!shared_compute_encoder_) {
+    EndRenderEncoder();
+    shared_compute_encoder_ = command_buffer->computeCommandEncoder();
+    if (!shared_compute_encoder_) {
+      return nullptr;
+    }
+    shared_compute_encoder_->retain();
+    shared_compute_command_buffer_ = command_buffer;
+    if (shared_memory_ && shared_memory_->hazards()) {
+      shared_compute_hazards_.Begin(*shared_memory_->hazards(), command_buffer,
+                                    shared_compute_encoder_);
+    }
+  }
+  *hazards_out = &shared_compute_hazards_;
+  return shared_compute_encoder_;
+}
+
+void MetalCommandProcessor::EndSharedComputeEncoder() {
+  if (!shared_compute_encoder_) {
+    return;
+  }
+  shared_compute_hazards_.End();
+  shared_compute_encoder_->endEncoding();
+  shared_compute_encoder_->release();
+  shared_compute_encoder_ = nullptr;
+  shared_compute_command_buffer_ = nullptr;
+}
+
 void MetalCommandProcessor::EndRenderEncoder() {
   SCOPE_profile_cpu_f("gpu");
+  EndSharedComputeEncoder();
   render_encoder_memexport_ranges_.clear();
   render_encoder_tile_resolve_ranges_.clear();
   render_encoder_index_count_ = 0;
@@ -7008,6 +7276,57 @@ void MetalCommandProcessor::UseRenderEncoderResource(MTL::Resource* resource,
   }
   declared_usage_bits |= usage_bits;
   current_render_encoder_->useResource(resource, usage);
+}
+
+void MetalCommandProcessor::SetRenderEncoderBuffer(RenderEncoderStage stage,
+                                                   MTL::Buffer* buffer,
+                                                   NS::UInteger offset,
+                                                   NS::UInteger index) {
+  bool offset_only = false;
+  if (index < kRenderEncoderTrackedBufferCount) {
+    RenderEncoderBuffer& bound = render_encoder_buffers_[size_t(stage)][index];
+    if (bound.valid && bound.buffer == buffer) {
+      if (bound.offset == offset) {
+        return;
+      }
+      offset_only = true;
+    }
+    bound.buffer = buffer;
+    bound.offset = offset;
+    bound.valid = true;
+  }
+  switch (stage) {
+    case RenderEncoderStage::kVertex:
+      if (offset_only) {
+        current_render_encoder_->setVertexBufferOffset(offset, index);
+      } else {
+        current_render_encoder_->setVertexBuffer(buffer, offset, index);
+      }
+      break;
+    case RenderEncoderStage::kFragment:
+      if (offset_only) {
+        current_render_encoder_->setFragmentBufferOffset(offset, index);
+      } else {
+        current_render_encoder_->setFragmentBuffer(buffer, offset, index);
+      }
+      break;
+    case RenderEncoderStage::kObject:
+      if (offset_only) {
+        current_render_encoder_->setObjectBufferOffset(offset, index);
+      } else {
+        current_render_encoder_->setObjectBuffer(buffer, offset, index);
+      }
+      break;
+    case RenderEncoderStage::kMesh:
+      if (offset_only) {
+        current_render_encoder_->setMeshBufferOffset(offset, index);
+      } else {
+        current_render_encoder_->setMeshBuffer(buffer, offset, index);
+      }
+      break;
+    default:
+      assert_unhandled_case(stage);
+  }
 }
 
 void MetalCommandProcessor::BeginCommandBuffer() {
@@ -7143,6 +7462,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
       render_target_cache_->SetRenderPassArea(pass_descriptor,
                                               GetDrawScissorBottom());
     }
+    EndSharedComputeEncoder();
     // If some path cleared the encoder without going through EndRenderEncoder,
     // avoid leaking cached binding state into the new encoder.
     render_encoder_shared_memory_hazards_.Abandon();
@@ -7167,8 +7487,10 @@ void MetalCommandProcessor::BeginCommandBuffer() {
       render_target_cache_->ConsumeRenderPassDescriptorClears(pass_descriptor);
     }
     ++render_passes_total_;
-    current_render_encoder_->setLabel(
-        NS::String::string("XeniaRenderEncoder", NS::UTF8StringEncoding));
+    if (debug_labels_) {
+      current_render_encoder_->setLabel(
+          NS::String::string("XeniaRenderEncoder", NS::UTF8StringEncoding));
+    }
     render_encoder_has_zpd_visibility_ =
         IsQueryPoolReady() && (pass_descriptor->visibilityResultBuffer() ==
                                zpd_visibility_pool_->visibility_buffer());
@@ -7434,8 +7756,10 @@ bool MetalCommandProcessor::EnsureSpirvUniformBuffer() {
       } else {
         ++suppressed_wait_logs;
       }
+      int64_t wait_start_ns = GetSteadyTimeNs();
       dispatch_semaphore_wait(spirv_uniforms_available_semaphore_,
                               DISPATCH_TIME_FOREVER);
+      NoteGpuWait(GpuWaitReason::kUniforms, wait_start_ns);
     }
   }
 
@@ -7717,6 +8041,41 @@ void MetalCommandProcessor::ScheduleSpirvArgumentBufferRelease(
   }
 }
 
+void MetalCommandProcessor::JoinPipelineArchiveSave() {
+  if (archive_save_thread_.joinable()) {
+    archive_save_thread_.join();
+  }
+  archive_save_running_ = false;
+}
+
+void MetalCommandProcessor::MaybeSavePipelineArchive() {
+  // Once the stored pipelines are rebuilt and nothing is compiling, so the
+  // compile threads don't wait for the save to add theirs.
+  if (archive_save_running_.load(std::memory_order_acquire) ||
+      !pipeline_archive_.unsaved_additions() ||
+      compile_activity.storage_loading.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (compile_activity.queued.load(std::memory_order_relaxed) !=
+      compile_activity.finished.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint64_t now = xe::Clock::QueryHostTickCount();
+  if (now - archive_saved_ticks_ <
+      kPipelineArchiveSaveSeconds * xe::Clock::QueryHostTickFrequency()) {
+    return;
+  }
+  archive_saved_ticks_ = now;
+  if (archive_save_thread_.joinable()) {
+    archive_save_thread_.join();
+  }
+  archive_save_running_ = true;
+  archive_save_thread_ = std::thread([this]() {
+    pipeline_archive_.Save();
+    archive_save_running_.store(false, std::memory_order_release);
+  });
+}
+
 void MetalCommandProcessor::EndCommandBuffer(CommandBufferKind next_kind) {
   if (shader_storage_flush_needed_ || pipeline_storage_flush_needed_) {
     storage_writer_.RequestFlush(shader_storage_flush_needed_,
@@ -7724,13 +8083,16 @@ void MetalCommandProcessor::EndCommandBuffer(CommandBufferKind next_kind) {
     shader_storage_flush_needed_ = false;
     pipeline_storage_flush_needed_ = false;
   }
+  MaybeSavePipelineArchive();
   if (current_command_buffer_) {
     next_submission_kind_ = next_kind;
   }
   EndRenderEncoder();
-  ResetMslCrossEncoderReuseCaches();
 
   if (current_command_buffer_) {
+    // Only a command buffer fills these. Without one (the worker runs here on
+    // every empty ring) they are already clear.
+    ResetMslCrossEncoderReuseCaches();
     // Texture loads that need nothing from this command buffer run before it.
     if (texture_cache_) {
       texture_cache_->CommitLoadsAhead();
@@ -7762,12 +8124,24 @@ void MetalCommandProcessor::ApplyDepthStencilState(
       regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
   auto depth_control = normalized_depth_control;
 
+  bool has_depth_attachment = false;
   bool has_stencil_attachment = false;
   if (current_render_pass_descriptor_) {
+    if (auto* depth_attachment =
+            current_render_pass_descriptor_->depthAttachment()) {
+      has_depth_attachment = depth_attachment->texture() != nullptr;
+    }
     if (auto* stencil_attachment =
             current_render_pass_descriptor_->stencilAttachment()) {
       has_stencil_attachment = stencil_attachment->texture() != nullptr;
     }
+  }
+
+  // Without a depth attachment, the depth test passes and nothing is written
+  // either way, but Metal rejects a state that enables either.
+  if (!has_depth_attachment) {
+    depth_control.z_enable = 0;
+    depth_control.z_write_enable = 0;
   }
 
   if (!has_stencil_attachment && depth_control.stencil_enable) {
@@ -7861,7 +8235,10 @@ void MetalCommandProcessor::ApplyDepthStencilState(
     depth_stencil_state_cache_.emplace(key, state);
   }
 
-  current_render_encoder_->setDepthStencilState(state);
+  if (state != msl_depth_stencil_state_) {
+    current_render_encoder_->setDepthStencilState(state);
+    msl_depth_stencil_state_ = state;
+  }
 
   if (depth_control.stencil_enable) {
     uint32_t ref_front = stencil_ref_mask_front.stencilref;
@@ -7892,11 +8269,8 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
       cull_mode = MTL::CullModeBack;
     }
   }
-  current_render_encoder_->setCullMode(cull_mode);
-
-  current_render_encoder_->setFrontFacingWinding(
-      pa_su_sc_mode_cntl.face ? MTL::WindingClockwise
-                              : MTL::WindingCounterClockwise);
+  MTL::Winding winding = pa_su_sc_mode_cntl.face ? MTL::WindingClockwise
+                                                 : MTL::WindingCounterClockwise;
 
   MTL::TriangleFillMode fill_mode = MTL::TriangleFillModeFill;
   if (primitive_polygonal &&
@@ -7914,7 +8288,6 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
       fill_mode = MTL::TriangleFillModeLines;
     }
   }
-  current_render_encoder_->setTriangleFillMode(fill_mode);
 
   float polygon_offset_scale = 0.0f;
   float polygon_offset = 0.0f;
@@ -7930,15 +8303,41 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
   if (NeedsExactFloatDepthBias(regs)) {
     depth_bias_constant = depth_bias_slope = 0.0f;
   }
-  current_render_encoder_->setDepthBias(depth_bias_constant, depth_bias_slope,
-                                        0.0f);
 
   // With force_depth_clamp, use the host viewport clamp instead of near and far
   // Z plane clipping. X/Y/W clipping is unchanged.
-  current_render_encoder_->setDepthClipMode(
+  MTL::DepthClipMode depth_clip_mode =
       (pa_cl_clip_cntl.clip_disable || cvars::force_depth_clamp)
           ? MTL::DepthClipModeClamp
-          : MTL::DepthClipModeClip);
+          : MTL::DepthClipModeClip;
+
+  // Encoder state persists until changed, so only what differs from the last
+  // draw in this encoder is set.
+  bool all = !msl_rasterizer_state_valid_;
+  if (all || cull_mode != msl_cull_mode_) {
+    current_render_encoder_->setCullMode(cull_mode);
+  }
+  if (all || winding != msl_winding_) {
+    current_render_encoder_->setFrontFacingWinding(winding);
+  }
+  if (all || fill_mode != msl_fill_mode_) {
+    current_render_encoder_->setTriangleFillMode(fill_mode);
+  }
+  if (all || depth_bias_constant != msl_depth_bias_constant_ ||
+      depth_bias_slope != msl_depth_bias_slope_) {
+    current_render_encoder_->setDepthBias(depth_bias_constant, depth_bias_slope,
+                                          0.0f);
+  }
+  if (all || depth_clip_mode != msl_depth_clip_mode_) {
+    current_render_encoder_->setDepthClipMode(depth_clip_mode);
+  }
+  msl_rasterizer_state_valid_ = true;
+  msl_cull_mode_ = cull_mode;
+  msl_winding_ = winding;
+  msl_fill_mode_ = fill_mode;
+  msl_depth_bias_constant_ = depth_bias_constant;
+  msl_depth_bias_slope_ = depth_bias_slope;
+  msl_depth_clip_mode_ = depth_clip_mode;
 }
 
 MTL::RenderPassDescriptor*

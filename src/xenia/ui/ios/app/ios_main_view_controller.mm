@@ -35,6 +35,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
 #include "xenia/config.h"
+#include "xenia/cpu/backend/jit_memory_ios.h"
 #include "xenia/gpu/shader_storage.h"
 #include "xenia/base/clock.h"
 #include "xenia/gpu/metal/metal_compile_activity.h"
@@ -45,6 +46,7 @@
 
 #import "xenia/hid/touch/touch_layout_ios.h"
 #import "xenia/ui/ios/app/ios_controller_navigation_coordinator.h"
+#import "xenia/ui/ios/app/ios_external_display.h"
 #import "xenia/ui/ios/app/ios_in_game_menu_overlay.h"
 #import "xenia/ui/ios/app/ios_landscape_navigation_controller.h"
 #import "xenia/ui/ios/app/ios_window_layout.h"
@@ -380,6 +382,8 @@ struct LaunchPreparation {
 @property(nonatomic, assign) NSTimeInterval jitPollStartedAt;
 @property(nonatomic, assign) BOOL jitPollTimedOut;
 @property(nonatomic, assign) BOOL jitAcquired;
+// JIT was turned on, but its tool detached before a game could start (see XeJITUsable).
+@property(nonatomic, assign) BOOL jitTurnedOff;
 @property(nonatomic, assign) BOOL memoryEntitlementEnabled;
 - (BOOL)hasConnectedGameplayController;
 - (BOOL)shouldBlockGameplayInput;
@@ -392,6 +396,8 @@ struct LaunchPreparation {
 - (void)finishImportedGamesRefresh;
 - (void)presentJITRequiredAlertForLaunchPath:(const std::filesystem::path&)gamePath
                                  displayName:(NSString*)displayName;
+- (void)presentJITTurnedOffAlertForLaunchPath:(const std::filesystem::path&)gamePath
+                                  displayName:(NSString*)displayName;
 - (void)updateMemoryEntitlementStatusUI;
 - (void)presentMemoryEntitlementWarningForLaunchPath:(const std::filesystem::path&)gamePath
                                          displayName:(NSString*)displayName;
@@ -414,6 +420,7 @@ struct LaunchPreparation {
 - (void)dismissStatusToast;
 - (void)showStatusToastForMessage:(NSString*)message;
 - (void)presentLaunchProblemAlertWithMessage:(NSString*)message;
+- (void)presentSystemLinkOffPromptForTitleId:(uint32_t)title_id;
 - (void)presentLinkCouldNotBeOpenedAlert;
 - (void)presentGameActionsSheetForIndex:(size_t)game_index;
 - (void)presentTouchLayoutGamePicker;
@@ -518,6 +525,7 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
   NSArray<NSString*>* launcher_snapshot_signature_;
   CGSize last_collection_layout_size_;
   uint64_t library_refresh_generation_;
+  BOOL pruned_game_art_;
   BOOL compat_fetch_started_;
   BOOL update_check_started_;
   BOOL online_features_notice_presented_;
@@ -538,6 +546,11 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
   std::string active_touch_layout_local_id_;
   UITapGestureRecognizer* in_game_menu_tap_recognizer_;  // owned by self.view
   NSMutableArray<XeniaIOSExternalLibraryAccess*>* active_external_game_accesses_;
+  // Shown on the device, under the touch controls, while the game is on an
+  // external display. Owned by self.view.
+  UIView* external_display_status_view_;
+  UILabel* external_display_status_hint_;
+  NSObject* external_display_accessory_registration_;
   // A launch is gathering its folders off the main thread; another waits for it.
   BOOL launch_preparing_;
   // The last library launch and the folders it holds, so the title's start
@@ -595,9 +608,13 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
         [resource_pressure_owner showStatusToast:message style:XeniaIOSStatusToastStyleWarning];
       });
   __unsafe_unretained XeniaViewController* system_link_owner = self;
-  xe_ios_system_link_install(^(NSString* message, XeniaIOSStatusToastStyle style) {
-    [system_link_owner showStatusToast:message style:style];
-  });
+  xe_ios_system_link_install(
+      ^(NSString* message, XeniaIOSStatusToastStyle style) {
+        [system_link_owner showStatusToast:message style:style];
+      },
+      ^(uint32_t title_id) {
+        [system_link_owner presentSystemLinkOffPromptForTitleId:title_id];
+      });
   xe_ios_system_link_watch_online(
       ^BOOL {
         return !system_link_owner.gameRunning && system_link_owner.launcherOverlayView &&
@@ -643,6 +660,7 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
       UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   self.shaderCompileIndicator = compile_indicator;
   [self.view insertSubview:compile_indicator aboveSubview:self.metalView];
+  [self createExternalDisplayStatusView];
 
   // Create the iOS touch overlay above the Metal view. Hidden by default;
   // visibility is driven by -updateTouchControlsOverlayVisibilityAnimated:.
@@ -840,6 +858,17 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
                                            selector:@selector(handleControllerConnectionChanged:)
                                                name:GCControllerDidDisconnectNotification
                                              object:nil];
+  [[NSNotificationCenter defaultCenter] addObserver:self
+                                           selector:@selector(handleExternalDisplayHostChanged:)
+                                               name:XeniaExternalDisplayHostDidChangeNotification
+                                             object:nil];
+  external_display_accessory_registration_ = XeniaExternalDisplayRegisterSceneAccessory(self);
+  // A display may have connected before this view loaded.
+  [self updateExternalDisplayPresentation];
+}
+
+- (void)handleExternalDisplayHostChanged:(NSNotification* __unused)note {
+  [self updateExternalDisplayPresentation];
 }
 
 - (void)onExternalLibraryDidChange:(NSNotification* __unused)note {
@@ -933,6 +962,9 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
 
 - (void)handleAppDidBecomeActive:(NSNotification* __unused)note {
   [self updateMemoryEntitlementStatusUI];
+  if (!self.gameRunning) {
+    [self noteJITTurnedOff];
+  }
   if (!self.jitAcquired && !self.jitPollTimer) {
     [self startJITPoll];
   }
@@ -1442,9 +1474,37 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
 // JIT polling -- starts responsive, then backs off to avoid burning battery
 // forever when StikDebug / JIT is unavailable.
 // ---------------------------------------------------------------------------
+// On the TXM path the JIT tool prepares the code region when the first game starts, so it must
+// still be attached then. CS_DEBUGGED stays set after it detaches, which
+// xe_check_jit_available can't tell apart.
+static bool XeJITUsable() {
+  using xe::cpu::backend::IOSJitMemory;
+  return xe_check_jit_available() &&
+         (!IOSJitMemory::NeedsAttachedTool() || IOSJitMemory::ToolAttached());
+}
+
+// Notices that JIT was turned on but its tool has detached before a game could start, and waits
+// for it again. Returns YES when it has.
+- (BOOL)noteJITTurnedOff {
+  if (!xe_check_jit_available() || XeJITUsable()) {
+    return NO;
+  }
+  if (!self.jitTurnedOff) {
+    XELOGW("iOS: the JIT tool detached before a game started");
+  }
+  self.jitAcquired = NO;
+  self.jitTurnedOff = YES;
+  [self updateJITStatusIndicator];
+  [self updateJITAvailabilityUI];
+  if (!self.jitPollTimer) {
+    [self startJITPoll];
+  }
+  return YES;
+}
+
 - (void)startJITPoll {
   // Check immediately first.
-  if (xe_check_jit_available()) {
+  if (XeJITUsable()) {
     [self onJITAcquired];
     return;
   }
@@ -1461,9 +1521,14 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
     return;
   }
   self.jitPollTimer = nil;
-  if (xe_check_jit_available()) {
+  if (XeJITUsable()) {
     [self onJITAcquired];
     return;
+  }
+  if (!self.jitTurnedOff && xe_check_jit_available()) {
+    // Turned on, but the tool detached again before it was noticed.
+    self.jitTurnedOff = YES;
+    [self updateJITStatusIndicator];
   }
 
   const NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - self.jitPollStartedAt;
@@ -1493,6 +1558,7 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
   self.jitPollTimer = nil;
   self.jitPollTimedOut = NO;
   self.jitAcquired = YES;
+  self.jitTurnedOff = NO;
   XELOGI("iOS: JIT acquired!");
   [self updateJITStatusIndicator];
   [self updateJITAvailabilityUI];
@@ -1623,6 +1689,9 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
     [unsafe_self requestStikDebugJITHandoffForPendingLaunchPath:nullptr
                                               requirePreference:NO
                                    promptForAutomationOnSuccess:NO];
+  };
+  self.launcherOverlayView.headerOverArtChangedHandler = ^{
+    [unsafe_self setNeedsStatusBarAppearanceUpdate];
   };
   self.launcherOverlayView.addMenu = [self libraryAddMenu];
   self.launcherOverlayView.zarSuggestionHandler = ^{
@@ -2575,7 +2644,7 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
                             finish(NO);
                             return;
                           }
-                          BOOL signed_in = app_context->SignInProfile(xuid);
+                          BOOL signed_in = app_context->SignInProfile(xuid, user_index);
                           if (signed_in) {
                             [self showStatusToast:
                                       [NSString stringWithFormat:NSLocalizedString(
@@ -2642,7 +2711,7 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
                                                 finish(NO);
                                                 return;
                                               }
-                                              BOOL signed_in = self.appContext->SignInProfile(xuid);
+                                              BOOL signed_in = self.appContext->SignInProfile(xuid, user_index);
                                               finish(signed_in);
                                             }]];
   }
@@ -2783,6 +2852,11 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
   if (self.jitAcquired) {
     [self.launcherOverlayView
         setJITStatusText:NSLocalizedString(@"JIT Enabled", @"Launcher status: JIT is enabled")];
+  } else if (self.jitTurnedOff) {
+    [self.launcherOverlayView
+        setJITStatusText:NSLocalizedString(
+                             @"Reconnect StikDebug.",
+                             @"Launcher status: the JIT tool detached after JIT was turned on")];
   } else if (self.jitPollTimedOut) {
     [self.launcherOverlayView
         setJITStatusText:NSLocalizedString(
@@ -2856,6 +2930,16 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
       if (refresh_generation == unsafe_self->library_refresh_generation_) {
         unsafe_self->discovered_games_ = std::move(*scanned_games_owner);
         [unsafe_self finishImportedGamesRefresh];
+        // Prune covers against a finished scan only. The saved list shown at launch can be
+        // missing games, and their covers would be deleted.
+        if (!unsafe_self->pruned_game_art_) {
+          unsafe_self->pruned_game_art_ = YES;
+          NSMutableSet<NSNumber*>* keep = [NSMutableSet set];
+          for (const IOSDiscoveredGame& game : unsafe_self->discovered_games_) {
+            [keep addObject:@(game.title_id)];
+          }
+          xe_prune_game_art_cache(keep);
+        }
         if (completion_copy) {
           completion_copy(unsafe_self->discovered_games_);
         }
@@ -2914,6 +2998,42 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
   UIViewController* presenter = [self topPresentedControllerForModalPresentation] ?: self;
   [presenter presentViewController:sheet animated:YES completion:nil];
   [sheet release];
+}
+
+- (void)presentJITTurnedOffAlertForLaunchPath:(const std::filesystem::path&)gamePath
+                                  displayName:(NSString*)displayName {
+  // Once JIT is back, however the user turns it on, offer to open StikDebug automatically.
+  SetUserDefaultBool(kXeniaPendingStikDebugAutomationPromptPreferenceKey, true);
+  NSString* launch_path_string = gamePath.empty() ? nil : ToNSString(gamePath.string());
+  UIAlertController* alert = [UIAlertController
+      alertControllerWithTitle:NSLocalizedString(
+                                   @"JIT Was Turned Off",
+                                   @"Alert title: the JIT tool detached before the game started")
+                       message:NSLocalizedString(
+                                   @"JIT was turned off before the game started. Open StikDebug, "
+                                   @"enable JIT for XeniOS again, and keep it connected until "
+                                   @"the game is running.",
+                                   @"Alert message: the JIT tool detached before the game started")
+                preferredStyle:UIAlertControllerStyleAlert];
+  __unsafe_unretained XeniaViewController* unsafe_self = self;
+  [alert addAction:[UIAlertAction
+                       actionWithTitle:NSLocalizedString(@"Set Up JIT",
+                                                         @"Alert button: opens the JIT setup sheet")
+                                 style:UIAlertActionStyleDefault
+                               handler:^(__unused UIAlertAction* action) {
+                                 std::filesystem::path launch_path;
+                                 if (launch_path_string.length > 0) {
+                                   launch_path =
+                                       std::filesystem::path(launch_path_string.UTF8String);
+                                 }
+                                 [unsafe_self presentJITRequiredAlertForLaunchPath:launch_path
+                                                                       displayName:displayName];
+                               }]];
+  [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"Alert button: dismiss")
+                                            style:UIAlertActionStyleCancel
+                                          handler:nil]];
+  UIViewController* presenter = [self topPresentedControllerForModalPresentation] ?: self;
+  [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)presentMemoryEntitlementWarningForLaunchPath:(const std::filesystem::path&)gamePath
@@ -3017,7 +3137,9 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
     XELOGI("iOS: Automatic StikDebug handoff deferred (touch layout install pending)");
     return NO;
   }
-  if (self.jitAcquired || xe_check_jit_available()) {
+  // A tool that detached leaves JIT acquired but unusable; hand off again.
+  [self noteJITTurnedOff];
+  if (self.jitAcquired || XeJITUsable()) {
     if (!self.jitAcquired) {
       [self onJITAcquired];
     }
@@ -3623,6 +3745,14 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
     return;
   }
 
+  if ([self noteJITTurnedOff]) {
+    if ([self requestAutomaticStikDebugJITHandoffForPendingLaunchPath:&launch_path]) {
+      pending_external_launch_path_ = launch_path;
+    } else {
+      [self presentJITTurnedOffAlertForLaunchPath:launch_path displayName:display_name];
+    }
+    return;
+  }
   if (!self.jitAcquired) {
     [self presentJITRequiredAlertForLaunchPath:launch_path displayName:display_name];
     return;
@@ -4471,7 +4601,9 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
   if (!self.metalView) {
     return;
   }
-  const CGRect parent = self.view.bounds;
+  UIView* host = self.metalView.superview;
+  const BOOL on_external_display = host && host != self.view;
+  const CGRect parent = on_external_display ? host.bounds : self.view.bounds;
   if (CGRectIsEmpty(parent)) {
     return;
   }
@@ -4483,11 +4615,142 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
   }
   self.metalView.xeniaDrawableAspectRatio =
       mode == XeniaIOSWindowScalingModeStretch ? parent_aspect : guest_aspect;
-  CGRect frame = XeniaIOSMetalViewFrameForParent(parent, guest_aspect, mode,
-                                                 XeniaIOSCurrentPortraitWindowOffset());
+  // The portrait position offset is for the device screen only.
+  CGRect frame = XeniaIOSMetalViewFrameForParent(
+      parent, guest_aspect, mode,
+      on_external_display ? CGPointZero : XeniaIOSCurrentPortraitWindowOffset());
 
   if (!CGRectEqualToRect(self.metalView.frame, frame)) {
     self.metalView.frame = frame;
+  }
+  // On an external display, draw at the display's own resolution (capped at
+  // 2160 rows) rather than the 720-row default, so the TV doesn't upscale it.
+  CGFloat drawable_height = 0.0;
+  if (on_external_display) {
+    UIScreen* screen = host.window.windowScene.screen;
+    const CGFloat scale = screen ? screen.nativeScale : 1.0;
+    const CGFloat visible_height = MIN(frame.size.height, parent.size.height);
+    drawable_height = MIN(MAX(std::round(visible_height * scale), 720.0), 2160.0);
+  }
+  self.metalView.xeniaDrawableHeight = drawable_height;
+}
+
+#pragma mark - External display
+
+- (void)createExternalDisplayStatusView {
+  UIView* status = [[[UIView alloc] initWithFrame:self.view.bounds] autorelease];
+  status.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+  status.backgroundColor = [UIColor systemGroupedBackgroundColor];
+  // Taps go through to the in-game menu recognizer on self.view.
+  status.userInteractionEnabled = NO;
+  status.hidden = YES;
+
+  UIImageSymbolConfiguration* symbol_config =
+      [UIImageSymbolConfiguration configurationWithPointSize:56.0
+                                                      weight:UIImageSymbolWeightRegular];
+  UIImageView* icon =
+      [[[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"tv"
+                                                  withConfiguration:symbol_config]] autorelease];
+  icon.tintColor = [UIColor secondaryLabelColor];
+  icon.contentMode = UIViewContentModeScaleAspectFit;
+
+  UILabel* title = [[[UILabel alloc] initWithFrame:CGRectZero] autorelease];
+  title.text = NSLocalizedString(@"Playing on External Display",
+                                 @"Device screen while the game is shown on a TV or monitor");
+  title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle3];
+  title.adjustsFontForContentSizeCategory = YES;
+  title.textColor = [UIColor labelColor];
+  title.textAlignment = NSTextAlignmentCenter;
+  title.numberOfLines = 0;
+
+  UILabel* hint = [[[UILabel alloc] initWithFrame:CGRectZero] autorelease];
+  hint.text = NSLocalizedString(@"Tap anywhere to open the menu.",
+                                @"Device screen hint while the game is on an external display "
+                                @"and a controller is connected");
+  hint.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+  hint.adjustsFontForContentSizeCategory = YES;
+  hint.textColor = [UIColor secondaryLabelColor];
+  hint.textAlignment = NSTextAlignmentCenter;
+  hint.numberOfLines = 0;
+
+  UIStackView* stack =
+      [[[UIStackView alloc] initWithArrangedSubviews:@[ icon, title, hint ]] autorelease];
+  stack.axis = UILayoutConstraintAxisVertical;
+  stack.alignment = UIStackViewAlignmentCenter;
+  stack.spacing = 12.0;
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  [status addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.centerXAnchor constraintEqualToAnchor:status.centerXAnchor],
+    [stack.centerYAnchor constraintEqualToAnchor:status.centerYAnchor],
+    [stack.leadingAnchor
+        constraintGreaterThanOrEqualToAnchor:status.layoutMarginsGuide.leadingAnchor],
+    [stack.trailingAnchor
+        constraintLessThanOrEqualToAnchor:status.layoutMarginsGuide.trailingAnchor],
+  ]];
+
+  [self.view insertSubview:status belowSubview:self.shaderCompileIndicator];
+  external_display_status_view_ = status;
+  external_display_status_hint_ = hint;
+}
+
+- (void)updateExternalDisplayStatusView {
+  if (!external_display_status_view_ || external_display_status_view_.hidden) {
+    return;
+  }
+  // With a controller the touch controls are hidden and the device screen is
+  // only for the menu, so dim it.
+  const BOOL controller = [self hasConnectedGameplayController];
+  external_display_status_hint_.hidden = !controller;
+  external_display_status_view_.backgroundColor =
+      controller ? [UIColor blackColor] : [UIColor systemGroupedBackgroundColor];
+  for (UIView* subview in external_display_status_view_.subviews) {
+    subview.alpha = controller ? 0.45 : 1.0;
+  }
+  if (controller) {
+    external_display_status_view_.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+  } else {
+    external_display_status_view_.overrideUserInterfaceStyle = UIUserInterfaceStyleUnspecified;
+  }
+}
+
+// Puts the game on the external display while one is connected and a game is
+// running, and back on the device otherwise (including when the display goes
+// away mid-game). The Metal layer and its presenter stay connected throughout;
+// the next layout pass resizes the drawable and the display link follows the
+// view's screen.
+- (void)updateExternalDisplayPresentation {
+  if (!self.isViewLoaded || !self.metalView) {
+    return;
+  }
+  UIView* external_host = self.gameRunning ? XeniaExternalDisplayHostView() : nil;
+  // With Stage Manager the app's own window may already be on the external
+  // screen, with no separate external display scene; then nothing moves.
+  if (external_host &&
+      external_host.window.windowScene.screen == self.view.window.windowScene.screen) {
+    external_host = nil;
+  }
+  UIView* target = external_host ? external_host : self.view;
+  if (self.metalView.superview != target) {
+    if (external_host) {
+      [external_host addSubview:self.metalView];
+      XELOGI("iOS: showing the game on the external display");
+    } else {
+      // Back to its place under the status view, compile indicator and touch controls.
+      [self.view insertSubview:self.metalView belowSubview:external_display_status_view_];
+      XELOGI("iOS: showing the game on the device screen");
+    }
+    UIScreen* screen = target.window.windowScene.screen;
+    self.metalView.contentScaleFactor = screen ? screen.scale : 1.0;
+  }
+  XeniaExternalDisplaySetHostingGame(external_host != nil);
+  if (external_display_status_view_) {
+    external_display_status_view_.hidden = external_host == nil;
+    [self updateExternalDisplayStatusView];
+  }
+  [self applyMetalViewLayout];
+  if (self.appContext) {
+    self.appContext->NotifyLayoutChanged();
   }
 }
 
@@ -5053,7 +5316,10 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
 }
 
 - (UIStatusBarStyle)preferredStatusBarStyle {
-  return UIStatusBarStyleLightContent;
+  // Light over the hero art; over the library's own background it follows the appearance.
+  XeniaIOSLauncherOverlayView* launcher = self.launcherOverlayView;
+  return !launcher || launcher.hidden || launcher.headerOverArt ? UIStatusBarStyleLightContent
+                                                                : UIStatusBarStyleDefault;
 }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
@@ -5098,6 +5364,7 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
   [self setNeedsUpdateOfHomeIndicatorAutoHidden];
   [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
   [self setNeedsStatusBarAppearanceUpdate];
+  [self updateExternalDisplayPresentation];
 }
 
 #pragma mark - Public API
@@ -5142,6 +5409,11 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
 }
 
 - (void)presentGameLaunchFailureAlertWithMessage:(NSString*)message {
+  if ([self noteJITTurnedOff]) {
+    // The setup failed because the JIT tool detached; say how to fix that instead.
+    [self presentJITTurnedOffAlertForLaunchPath:std::filesystem::path() displayName:nil];
+    return;
+  }
   UIAlertController* alert = [UIAlertController
       alertControllerWithTitle:NSLocalizedString(@"Couldn't Start Game",
                                                  @"Alert title: the game failed to start")
@@ -5206,6 +5478,7 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
   [_achievementNotificationPresenter release];
   [_statusToastPresenter release];
   [active_external_game_accesses_ release];
+  [external_display_accessory_registration_ release];
   [launched_accesses_ release];
   [pending_url_confirmation_ release];
   [_metalView release];
@@ -5308,6 +5581,7 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
   // the overlay is hidden (e.g. hardware controller connected) or when the
   // in-game menu is up and a tap-outside should dismiss it.
   in_game_menu_tap_recognizer_.enabled = !overlay_visible;
+  [self updateExternalDisplayStatusView];
 }
 
 - (void)showStatusToast:(NSString*)message style:(XeniaIOSStatusToastStyle)style {
@@ -5324,6 +5598,57 @@ static constexpr NSUInteger kXeniaIOSTouchLayoutURLMaxLength = 2048;
 
 - (void)dismissStatusToast {
   [self.statusToastPresenter dismiss];
+}
+
+// Some games, such as Black Ops 2, stop with an error when they find no network. Turning System
+// Link on tells the running game, as a console does when its network cable is plugged in.
+- (void)presentSystemLinkOffPromptForTitleId:(uint32_t)title_id {
+  if (!self.gameRunning || active_game_title_id_ != title_id) {
+    return;
+  }
+  UIViewController* presenter = [self topPresentedControllerForModalPresentation] ?: self;
+  NSString* reason =
+      NSLocalizedString(@"This game looks for a network, and some games stop with an error "
+                        @"without one. System Link gives it one.",
+                        @"Alert message: a game looked for a network while System Link is off");
+  void (^turned_on)(void) = ^{
+    [self showStatusToast:NSLocalizedString(@"System Link is on. If the game showed an error, "
+                                            @"try again.",
+                                            @"Toast: System Link was turned on mid-game")
+                    style:XeniaIOSStatusToastStyleSuccess];
+  };
+  if (xe_ios_online_features_enabled()) {
+    // Online features are on, so the config file has System Link off. Turn On sets it back to
+    // playing over the internet, as it is by default.
+    UIAlertController* alert = [UIAlertController
+        alertControllerWithTitle:NSLocalizedString(@"Turn On System Link?",
+                                                   @"Alert title: a game looked for a "
+                                                   @"network while System Link is off")
+                         message:reason
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction
+                         actionWithTitle:NSLocalizedString(@"Not Now", @"Alert button: dismiss")
+                                   style:UIAlertActionStyleCancel
+                                 handler:nil]];
+    [alert addAction:[UIAlertAction
+                         actionWithTitle:NSLocalizedString(@"Turn On",
+                                                           @"Alert button: turn on System Link")
+                                   style:UIAlertActionStyleDefault
+                                 handler:^(__unused UIAlertAction* action) {
+                                   xe_ios_system_link_use_relay();
+                                   turned_on();
+                                 }]];
+    [presenter presentViewController:alert animated:YES completion:nil];
+    return;
+  }
+  // One tap: the reason and the Online features consent share one alert.
+  xe_ios_confirm_turn_on_system_link(presenter, reason, ^{
+    if (!xe_ios_system_link_uses_relay()) {
+      xe_ios_system_link_use_relay();
+    }
+    xe_ios_set_online_features_enabled(YES);
+    turned_on();
+  });
 }
 
 // Errors and states with a next step are never toasts: a toast vanishes in a few seconds and has

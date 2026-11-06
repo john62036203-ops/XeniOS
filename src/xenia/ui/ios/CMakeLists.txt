@@ -21,6 +21,8 @@ target_sources(xenia-ui-ios PRIVATE
   app/ios_pause_workspace_view_controller.mm
   app/ios_display_settings_view_controller.h
   app/ios_display_settings_view_controller.mm
+  app/ios_external_display.h
+  app/ios_external_display.mm
   app/ios_window_layout.h
   app/ios_window_layout.mm
   app/ios_window_position_overlay.h
@@ -104,6 +106,8 @@ target_sources(xenia-ui-ios PRIVATE
   launcher/ios_game_tile_cell.mm
   launcher/ios_launcher_overlay_view.h
   launcher/ios_launcher_overlay_view.mm
+  launcher/ios_library_ambient_view.h
+  launcher/ios_library_ambient_view.mm
   launcher/ios_system_link_view_controller.h
   launcher/ios_system_link_view_controller.mm
   launcher/zar_converter.h
@@ -235,6 +239,7 @@ target_link_libraries(xenia-ui-ios PUBLIC
   "-framework Foundation"
   "-framework GameController"
   "-framework ImageIO"
+  "-framework IOSurface"
   "-framework Metal"
   "-framework MetalKit"
   "-framework PhotosUI"

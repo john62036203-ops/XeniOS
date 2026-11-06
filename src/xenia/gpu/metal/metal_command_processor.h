@@ -40,9 +40,11 @@
 #include "xenia/gpu/metal/dxil_shader.h"
 #include "xenia/gpu/metal/metal_buffer_hazards.h"
 #include "xenia/gpu/metal/metal_dxil_binder.h"
+#include "xenia/gpu/metal/metal_pipeline_archive.h"
 #include "xenia/gpu/metal/metal_primitive_processor.h"
 #include "xenia/gpu/metal/metal_render_target_cache.h"
 #include "xenia/gpu/metal/metal_shader_converter.h"
+#include "xenia/gpu/metal/metal_shader_library_cache.h"
 #include "xenia/gpu/metal/metal_shared_memory.h"
 #include "xenia/gpu/metal/metal_texture_cache.h"
 #include "xenia/gpu/metal/metal_zpd_visibility_pool.h"
@@ -98,11 +100,31 @@ class MetalCommandProcessor : public CommandProcessor {
   bool HasActiveRenderEncoder() const {
     return current_render_encoder_ != nullptr;
   }
+  // Whether to label per-frame command buffers and encoders. Only GPU captures
+  // and the validation layer show them, and each costs a string and a driver
+  // call.
+  bool debug_labels() const { return debug_labels_; }
   // Ends the encoders the command processor keeps open on the command buffer if
   // it's the current one, so the caller can encode its own work after them.
   void EndEncodersForCommandBuffer(MTL::CommandBuffer* command_buffer) {
     if (command_buffer && command_buffer == current_command_buffer_) {
       EndRenderEncoder();
+    }
+  }
+  // A compute encoder that resolves and texture loads share on the current
+  // command buffer, so the compute work between two render passes takes one
+  // encoder rather than one per resolve or load. EndRenderEncoder ends it, and
+  // so must anything else encoding into the command buffer. Returns nullptr
+  // for any other command buffer. Shared memory isn't hazard tracked, so a
+  // user reporting an access that conflicts with an earlier one in the
+  // encoder (hazards->Access returning true) adds a memory barrier.
+  MTL::ComputeCommandEncoder* BeginSharedComputeEncoder(
+      MTL::CommandBuffer* command_buffer,
+      MetalBufferHazards::Encoder** hazards_out);
+  void EndSharedComputeEncoder();
+  void EndSharedComputeEncoder(MTL::CommandBuffer* command_buffer) {
+    if (command_buffer && command_buffer == shared_compute_command_buffer_) {
+      EndSharedComputeEncoder();
     }
   }
   uint32_t current_draw_index() const { return current_draw_index_; }
@@ -131,12 +153,31 @@ class MetalCommandProcessor : public CommandProcessor {
     kSubmissionPassLimit,
     kCount,
   };
+  // What the CPU waited for the GPU for, to attribute the per-frame wait time.
+  enum class GpuWaitReason : uint32_t {
+    kMemexport,
+    kZpdQuery,
+    kShaderDoneFence,
+    kTracePlayback,
+    kUniforms,
+    kResolve,
+    kTextureUpload,
+    kScaledResolveCopy,
+    kSnapshot,
+    kDump,
+    kResolveBeforeGuestRead,
+    kCount,
+  };
 
   MTL::CommandBuffer* EnsureCommandBuffer();
   // Creates a command buffer with GPU time accounting attached. Every command
   // buffer the backend commits outside the submission one has to come from
   // here, or its work is missing from gpu_busy_us_per_frame.
   MTL::CommandBuffer* CreateAccountedCommandBuffer(CommandBufferKind kind);
+  // Commits a command buffer of its own whose results the CPU needs right
+  // away, and waits for it, counting the wait as reason.
+  void CommitAndAwait(MTL::CommandBuffer* command_buffer,
+                      GpuWaitReason reason);
   // For one released without ever being committed - its completion handler
   // will never run, so the accounting has to be released by hand.
   void DiscardAccountedCommandBuffer(MTL::CommandBuffer* command_buffer,
@@ -188,6 +229,17 @@ class MetalCommandProcessor : public CommandProcessor {
   // Whether the open pass used a view of the same texture as any of these.
   bool RenderEncoderUsesAnyTexture(
       std::span<MTL::Texture* const> textures) const;
+  enum class RenderEncoderStage : uint32_t {
+    kVertex,
+    kFragment,
+    kObject,
+    kMesh,
+    kCount,
+  };
+  // Binds a buffer to a stage of the current render encoder unless it's already
+  // bound there at this offset.
+  void SetRenderEncoderBuffer(RenderEncoderStage stage, MTL::Buffer* buffer,
+                              NS::UInteger offset, NS::UInteger index);
   void EnsureCommandBufferAutoreleasePool();
   void DrainCommandBufferAutoreleasePool();
   // Sub-allocates from a command-buffer scoped pool, recycled once the GPU is
@@ -236,6 +288,8 @@ class MetalCommandProcessor : public CommandProcessor {
   // the autorelease pool is drained, preventing hangs from deferred
   // deallocation.
   void PrepareForWait() override;
+  void AwaitGpuWritesBeforeGuestRead() override;
+  uint64_t GetHeldGpuWritesSubmission() override;
   void SubmitBeforeShortMemoryPoll() override { PrepareForWait(); }
   void PollCompletedSubmission() override;
 
@@ -337,6 +391,9 @@ class MetalCommandProcessor : public CommandProcessor {
   // Blocks until the given submission's command buffer has completed. The
   // submission must already be committed.
   void AwaitSubmissionCompletion(uint64_t submission);
+  // Adds a wait that started at wait_start_ns to the frame's wait time.
+  void NoteGpuWait(GpuWaitReason reason, int64_t wait_start_ns);
+  void LogFrameGpuWaits();
   void AddGpuTimeHandler(MTL::CommandBuffer* command_buffer);
   // Counts a command buffer that didn't complete, logging the first of each kind.
   void LogCommandBufferFailure(MTL::CommandBuffer* command_buffer,
@@ -476,7 +533,14 @@ class MetalCommandProcessor : public CommandProcessor {
                                              SpirvShaderTranslator& translator);
   // Builds the Metal function of one translation on whichever guest shader
   // path is active: SPIR-V -> MSL, or SPIR-V -> DXIL -> AIR.
-  bool CompileHostShader(Shader::Translation* translation, bool is_ios);
+  bool CompileHostShader(Shader::Translation* translation, bool is_ios,
+                         std::vector<uint8_t>* metallib_out = nullptr);
+  // EnsureTranslationSpirv then CompileHostShader, or neither when the title's
+  // shader library cache has what they would make. kPending as for
+  // EnsureTranslationSpirv.
+  ShaderCompileStatus TranslateAndCompileHostShader(
+      Shader::Translation* translation, SpirvShaderTranslator& translator,
+      bool is_ios);
   std::unique_ptr<SpirvShaderTranslator> CreateSpirvShaderTranslator() const;
   // The compiled function of a translation on the active path, null until
   // CompileHostShader has succeeded for it.
@@ -496,6 +560,7 @@ class MetalCommandProcessor : public CommandProcessor {
   void FinishAsyncCompileTaskLocked();
   // Counts a request as finished for the progress and the rebuild record.
   void CountAsyncCompileTaskFinishedLocked();
+  void EndStorageLoadingIfDoneLocked();
   // Blocks until |done|, checked under async_compile_mutex_ after each finished
   // task, holds. The compile threads may use every core meanwhile.
   template <typename Done>
@@ -677,6 +742,11 @@ class MetalCommandProcessor : public CommandProcessor {
   // Whether the descriptor the current encoder was created from carried the
   // visibility result buffer, so a ZPD segment may be opened on it.
   bool render_encoder_has_zpd_visibility_ = false;
+  // The command buffer shared_compute_encoder_ is open on, or nullptr.
+  MTL::CommandBuffer* shared_compute_command_buffer_ = nullptr;
+  MTL::ComputeCommandEncoder* shared_compute_encoder_ = nullptr;
+  MetalBufferHazards::Encoder shared_compute_hazards_;
+  bool debug_labels_ = false;
 
   // Tracks resources marked via useResource for the current render encoder
   // to avoid redundant driver calls across draws within the same encoder.
@@ -1024,6 +1094,19 @@ class MetalCommandProcessor : public CommandProcessor {
   // Guest ucode (.xsh, shared with the other backends) and this backend's
   // pipeline descriptions (.metal.xpso), replayed at startup.
   ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
+  // The title's guest shaders as Metal libraries, so a later launch needn't
+  // translate them again (DXIL path).
+  MetalShaderLibraryCache shader_library_cache_;
+  // The title's compiled pipelines and specialized functions. Saved by
+  // archive_save_thread_ once the stored pipelines are rebuilt, then at most
+  // every kPipelineArchiveSaveSeconds while new ones are added.
+  MetalPipelineArchive pipeline_archive_;
+  std::thread archive_save_thread_;
+  std::atomic<bool> archive_save_running_{false};
+  uint64_t archive_saved_ticks_ = 0;
+  static constexpr uint64_t kPipelineArchiveSaveSeconds = 20;
+  void MaybeSavePipelineArchive();
+  void JoinPipelineArchiveSave();
   bool shader_storage_flush_needed_ = false;
   bool pipeline_storage_flush_needed_ = false;
   // Set while rebuilding from storage, so replay doesn't re-record what it
@@ -1223,6 +1306,18 @@ class MetalCommandProcessor : public CommandProcessor {
   MTL::DepthStencilState* msl_depth_stencil_state_ = nullptr;
   bool msl_stencil_reference_valid_ = false;
   uint32_t msl_stencil_reference_ = 0;
+  // The buffers SetRenderEncoderBuffer bound to the low indices of each stage
+  // of the current render encoder, where the Metal Shader Converter binding
+  // model puts its descriptor heaps and argument buffers.
+  struct RenderEncoderBuffer {
+    MTL::Buffer* buffer = nullptr;
+    NS::UInteger offset = 0;
+    bool valid = false;
+  };
+  static constexpr size_t kRenderEncoderTrackedBufferCount = 4;
+  std::array<std::array<RenderEncoderBuffer, kRenderEncoderTrackedBufferCount>,
+             size_t(RenderEncoderStage::kCount)>
+      render_encoder_buffers_{};
 
   // Fixed-function dynamic state cached per render encoder.
   float ff_blend_factor_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1251,6 +1346,14 @@ class MetalCommandProcessor : public CommandProcessor {
   uint64_t command_buffer_kind_counts_[kCommandBufferKindCount] = {};
   uint64_t command_buffer_kind_window_start_[kCommandBufferKindCount] = {};
   CommandBufferKind next_submission_kind_ = CommandBufferKind::kSubmissionOther;
+  // Time the CPU spent waiting for the GPU in the frame being recorded, and the
+  // command buffers created in it, logged by IssueSwap with
+  // metal_log_frame_gpu_waits.
+  static constexpr size_t kGpuWaitReasonCount = size_t(GpuWaitReason::kCount);
+  uint64_t frame_gpu_wait_ns_[kGpuWaitReasonCount] = {};
+  uint32_t frame_gpu_wait_counts_[kGpuWaitReasonCount] = {};
+  uint64_t command_buffer_kind_frame_start_[kCommandBufferKindCount] = {};
+  int64_t frame_log_start_ns_ = 0;
   // Each render encoder is a tile store plus an attachment reload on a TBDR
   // GPU, so the count per frame is comparable against Vulkan's render passes.
   uint64_t render_passes_total_ = 0;
@@ -1301,6 +1404,8 @@ class MetalCommandProcessor : public CommandProcessor {
   uint32_t current_draw_index_ = 0;
   // Resolve or memexport output written by the open submission.
   bool copy_resolve_writes_pending_ = false;
+  // The last submission a resolve wrote guest RAM in, with zero-copy.
+  uint64_t resolve_last_submission_ = 0;
 
   // Host viewport of the previous draw, reused while the inputs it was derived
   // from stay the same.
@@ -1314,17 +1419,15 @@ class MetalCommandProcessor : public CommandProcessor {
   // Export output lands in guest RAM through the shared buffer, so nothing is
   // ever staged for readback.
   void FlushMemexportStagingReadback() {}
-  void AwaitMemexportSubmission(uint64_t submission) {
-    AwaitAllQueueOperationsCompletion();
+  void AwaitMemexportSubmission(uint64_t submission);
+  // With zero-copy, export output is in guest RAM as soon as its submission
+  // completes, so a fence can be held back until then instead of waiting.
+  bool CanHoldSignalsForMemexport() const {
+    return shared_memory_->is_zero_copy();
   }
-  // Fences wait for export output.
-  // TODO(has207): hold them back as D3D12 and Vulkan do, as waiting stalls at
-  // every fence after a vertex shader export. submission_current_ is the
-  // command buffer being recorded and completions arrive in order. Missing are
-  // EndSubmissionForMemexport ending that command buffer and telling an ended
-  // submission apart from one still being recorded.
-  bool CanHoldSignalsForMemexport() const { return false; }
-  void EndSubmissionForMemexport() {}
+  void EndSubmissionForMemexport() {
+    EndCommandBuffer(CommandBufferKind::kSubmissionWait);
+  }
   // DXIL exports not yet separated from later GPU consumers by a pass boundary.
   std::vector<draw_util::MemExportRange> render_encoder_memexport_ranges_;
   // Guest memory written by tile resolves kept in the open pass: another tile

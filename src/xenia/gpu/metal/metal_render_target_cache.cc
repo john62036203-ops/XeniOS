@@ -859,6 +859,7 @@ bool MetalRenderTargetCache::Initialize() {
     MTL::CommandBuffer* cmd = command_processor_.CreateAccountedCommandBuffer(
         MetalCommandProcessor::CommandBufferKind::kRenderTargetOther);
     if (cmd) {
+      command_processor_.EndSharedComputeEncoder(cmd);
       MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
       if (blit) {
         blit->fillBuffer(
@@ -2632,6 +2633,7 @@ void MetalRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
     return;
   }
 
+  command_processor_.EndSharedComputeEncoder(cmd);
   MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
   if (!blit) {
     command_processor_.DiscardAccountedCommandBuffer(
@@ -2644,8 +2646,8 @@ void MetalRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
                        MTL::Size::Make(kWidth, kHeight, 1), texture, 0, 0,
                        MTL::Origin::Make(0, 0, 0));
   blit->endEncoding();
-  cmd->commit();
-  cmd->waitUntilCompleted();
+  command_processor_.CommitAndAwait(
+      cmd, MetalCommandProcessor::GpuWaitReason::kSnapshot);
   // cmd is autoreleased from commandBuffer() - do not release
   staging->release();
   if (metal_rt->needs_initial_clear()) {
@@ -3447,6 +3449,7 @@ void MetalRenderTargetCache::StoreTiledData(MTL::CommandBuffer* command_buffer,
       color_attachment->setLoadAction(MTL::LoadActionLoad);
       color_attachment->setStoreAction(MTL::StoreActionMultisampleResolve);
 
+      command_processor_.EndSharedComputeEncoder(command_buffer);
       MTL::RenderCommandEncoder* render_encoder =
           command_buffer->renderCommandEncoder(resolve_desc);
       if (render_encoder) {
@@ -3459,6 +3462,7 @@ void MetalRenderTargetCache::StoreTiledData(MTL::CommandBuffer* command_buffer,
   }
 
   // Create compute encoder
+  command_processor_.EndSharedComputeEncoder(command_buffer);
   MTL::ComputeCommandEncoder* encoder = command_buffer->computeCommandEncoder();
   if (!encoder) {
     if (temp_texture) {
@@ -3859,7 +3863,17 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
     }
     owns_command_buffer = true;
   }
-  MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
+  // In the current command buffer, share the compute encoder with the
+  // resolves and texture loads around this one.
+  MetalBufferHazards::Encoder own_hazards;
+  MetalBufferHazards::Encoder* hazards = &own_hazards;
+  MTL::ComputeCommandEncoder* encoder =
+      command_processor_.BeginSharedComputeEncoder(cmd, &hazards);
+  bool shared_encoder = encoder != nullptr;
+  if (!shared_encoder) {
+    command_processor_.EndSharedComputeEncoder(cmd);
+    encoder = cmd->computeCommandEncoder();
+  }
   if (!encoder) {
     if (owns_command_buffer) {
       command_processor_.DiscardAccountedCommandBuffer(
@@ -3868,11 +3882,14 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
     return false;
   }
 
-  MetalBufferHazards::Encoder hazards;
   if (shared->hazards()) {
-    hazards.Begin(*shared->hazards(), cmd, encoder);
-    hazards.Access(resolve_info.copy_dest_extent_start,
-                   resolve_info.copy_dest_extent_length, true);
+    if (!shared_encoder) {
+      own_hazards.Begin(*shared->hazards(), cmd, encoder);
+    }
+    if (hazards->Access(resolve_info.copy_dest_extent_start,
+                        resolve_info.copy_dest_extent_length, true)) {
+      encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+    }
   }
 
   bool encode_failed = false;
@@ -4114,11 +4131,13 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
     }
   }
 
-  hazards.End();
-  encoder->endEncoding();
+  if (!shared_encoder) {
+    own_hazards.End();
+    encoder->endEncoding();
+  }
   if (owns_command_buffer) {
-    cmd->commit();
-    cmd->waitUntilCompleted();
+    command_processor_.CommitAndAwait(
+        cmd, MetalCommandProcessor::GpuWaitReason::kResolve);
   }
   // cmd is autoreleased from commandBuffer() - do not release
   if (encode_failed) {
@@ -4878,7 +4897,7 @@ const char* MetalRenderTargetCache::TileResolveInOpenPass(
   encoder->dispatchThreadsPerTile(
       MTL::Size::Make(tile_width, tile_height, 1));
   command_processor_.SetRenderEncoderTileMemberClass(member_class);
-  XELOGI(
+  XELOGD(
       "tresolve: tile {}x{} to 0x{:08X} color{} kernel {} refresh {} pass "
       "{}x{} tile {}x{} imageblock {} of {}",
       constants.size[0], constants.size[1],
@@ -4914,6 +4933,7 @@ bool MetalRenderTargetCache::BeginEdramSnapshotReadback() {
   ScopedAutoreleasePool autorelease_pool;
   MTL::CommandBuffer* cmd = command_processor_.CreateAccountedCommandBuffer(
       MetalCommandProcessor::CommandBufferKind::kRenderTargetOther);
+  command_processor_.EndSharedComputeEncoder(cmd);
   MTL::BlitCommandEncoder* blit = cmd ? cmd->blitCommandEncoder() : nullptr;
   if (!blit) {
     command_processor_.DiscardAccountedCommandBuffer(
@@ -4923,8 +4943,8 @@ bool MetalRenderTargetCache::BeginEdramSnapshotReadback() {
   blit->copyFromBuffer(edram_buffer_, 0, edram_snapshot_download_buffer_, 0,
                        xenos::kEdramSizeBytes);
   blit->endEncoding();
-  cmd->commit();
-  cmd->waitUntilCompleted();
+  command_processor_.CommitAndAwait(
+      cmd, MetalCommandProcessor::GpuWaitReason::kSnapshot);
   return true;
 }
 
@@ -5039,6 +5059,7 @@ void MetalRenderTargetCache::DumpRenderTargets(
     owns_command_buffer = true;
   }
 
+  command_processor_.EndSharedComputeEncoder(cmd);
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
   if (!encoder) {
     XELOGE("MetalRenderTargetCache::DumpRenderTargets: no compute encoder");
@@ -5209,8 +5230,8 @@ void MetalRenderTargetCache::DumpRenderTargets(
 
   encoder->endEncoding();
   if (owns_command_buffer) {
-    cmd->commit();
-    cmd->waitUntilCompleted();
+    command_processor_.CommitAndAwait(
+        cmd, MetalCommandProcessor::GpuWaitReason::kDump);
   }
   // cmd is autoreleased from commandBuffer() - do not release
 }
@@ -5537,7 +5558,7 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
       return;
     }
     tile_pass_open = false;
-    XELOGI("tresolve: fallback {}", reason);
+    XELOGD("tresolve: fallback {}", reason);
     end_pass();
   };
   if (!tile_pass_open) {
@@ -5716,7 +5737,7 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
               resolve_info.copy_dest_extent_length);
           last_resolve_kept_pass_ = true;
         } else {
-          XELOGI("tresolve: end {}", refresh_target ? "refresh"
+          XELOGD("tresolve: end {}", refresh_target ? "refresh"
                                      : clears       ? "clear"
                                                     : "budget");
           end_pass();
@@ -5955,6 +5976,7 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
           owns_command_buffer = true;
         }
         if (cmd) {
+          command_processor_.EndSharedComputeEncoder(cmd);
           MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
           if (!encoder) {
             XELOGE(
@@ -5998,8 +6020,8 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
             hazards.End();
             encoder->endEncoding();
             if (owns_command_buffer) {
-              cmd->commit();
-              cmd->waitUntilCompleted();
+              command_processor_.CommitAndAwait(
+                  cmd, MetalCommandProcessor::GpuWaitReason::kResolve);
             }
             // cmd is autoreleased from commandBuffer() - do not release
 
@@ -6235,6 +6257,7 @@ MetalRenderTargetCache::TryPerformPairedResolveClear(
                      (rectangle.y_pixels + rectangle.height_pixels) *
                          draw_resolution_scale_y());
 
+  command_processor_.EndSharedComputeEncoder(cmd);
   auto* encoder = cmd->renderCommandEncoder(rp);
   if (!encoder) {
     return PairedClearResult::kFailed;
@@ -6638,6 +6661,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         HostDepthStoreRenderTargetConstant render_target_constant =
             GetHostDepthStoreRenderTargetConstant(dest_key.pitch_tiles_at_32bpp,
                                                   msaa_2x_supported_);
+        command_processor_.EndSharedComputeEncoder(cmd);
         MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
         if (!encoder) {
           XELOGE(
@@ -6853,6 +6877,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
     MTL::BlitCommandEncoder* blit_encoder = nullptr;
     auto ensure_blit_encoder = [&]() -> MTL::BlitCommandEncoder* {
       if (!blit_encoder) {
+        command_processor_.EndSharedComputeEncoder(cmd);
         blit_encoder = cmd->blitCommandEncoder();
       }
       return blit_encoder;
@@ -7191,6 +7216,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
                     draw_resolution_scale_y()
               : 0);
       transfer_encoder_area_height = uint32_t(rp->renderTargetHeight());
+      command_processor_.EndSharedComputeEncoder(cmd);
       transfer_encoder = cmd->renderCommandEncoder(rp);
       return transfer_encoder;
     };

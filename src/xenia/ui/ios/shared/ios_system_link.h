@@ -44,6 +44,27 @@ void xe_ios_join_system_link_room(uint32_t title_id, NSString* code);
 
 // Whether System Link is set to play through the relay.
 BOOL xe_ios_system_link_uses_relay(void);
+// Sets System Link to play through the relay, as it does by default, and tells the running game.
+void xe_ios_system_link_use_relay(void);
+
+// How the network the device is on treats direct connections between players, as System Link's
+// last check on it found.
+enum class XeniaIOSNatType { kUnknown, kOpen, kModerate, kStrict, kBlocked };
+// The current network's, checked when a game last started System Link on it. Unknown until then.
+XeniaIOSNatType xe_ios_system_link_nat(void);
+// Whether it keeps most direct connections out: strict or blocked.
+BOOL xe_ios_nat_blocks_direct(XeniaIOSNatType nat);
+// "Open", "Moderate", "Strict" or "Blocked", or nil while unknown.
+NSString* xe_ios_nat_type_name(XeniaIOSNatType nat);
+// What that means for playing, in a sentence, or nil while unknown.
+NSString* xe_ios_nat_type_explanation(XeniaIOSNatType nat);
+// Whether the lobby named a TURN server the last time a game joined it, so players can be
+// reached through a relay. Off until then.
+BOOL xe_ios_system_link_lobby_has_turn(void);
+// "Can't connect to 1 player. Your network blocks direct connections." for |count| players that
+// no path reaches, blaming this network when |nat| blocks direct connections and theirs
+// otherwise.
+NSString* xe_ios_system_link_unreachable_message(size_t count, XeniaIOSNatType nat);
 
 // What System Link is doing in the running game.
 struct XeniaIOSSystemLinkSnapshot {
@@ -59,6 +80,11 @@ struct XeniaIOSSystemLinkSnapshot {
   size_t others = 0;
   size_t direct = 0;
   size_t relayed = 0;
+  // Players reached neither way for about 10 seconds.
+  size_t unreachable = 0;
+  // This network's NAT type, once checked, and whether the lobby names a TURN server.
+  XeniaIOSNatType nat = XeniaIOSNatType::kUnknown;
+  bool turn = false;
   // Another player runs another title or another version of it.
   bool other_version = false;
   // The round trip to the slowest player reached directly; 0 until measured.
@@ -111,8 +137,10 @@ UIButton* xe_ios_new_system_link_online_button(void);
 void xe_ios_system_link_set_online_menu(void (^open)(void));
 
 // Lets games play over the internet while Online features are on, each in its room, and
-// tells the player what System Link does through |toast| on the main thread.
-// Call once.
-void xe_ios_system_link_install(void (^toast)(NSString* message, XeniaIOSStatusToastStyle style));
+// tells the player what System Link does through |toast| on the main thread. |link_off| is
+// called on the main thread the first time each game looks for a network while System Link is
+// off. Call once.
+void xe_ios_system_link_install(void (^toast)(NSString* message, XeniaIOSStatusToastStyle style),
+                                void (^link_off)(uint32_t title_id));
 
 #endif  // XENIA_UI_IOS_SHARED_IOS_SYSTEM_LINK_H_

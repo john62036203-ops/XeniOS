@@ -27,6 +27,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <unistd.h>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -475,6 +476,9 @@ constexpr std::chrono::milliseconds kSchedulerPauseTimeout{1500};
 // A live settings change keeps the game paused this long after the last change, so a slider
 // drag pauses once instead of once per tick.
 constexpr int64_t kLiveSettingsHoldNs = 250 * 1000 * 1000;
+// iOS kills an app that has not finished terminating after about 5 s (0x8BADF00D) and
+// reports it as a crash. Teardown that is still running at this point is cut short.
+constexpr int64_t kTeardownDeadlineNs = INT64_C(3) * 1000 * 1000 * 1000;
 // How long the emulator thread waits for the pause queue to drain before tearing down. It has to
 // outlast the slowest pause still in flight (the GPU wait, the audio and XMA pauses of about 2 s
 // each, the scheduler wait), or teardown frees the audio system and the scheduler under it.
@@ -1264,7 +1268,7 @@ bool EmulatorAppIOS::OnInitialize() {
     return uint64_t(0);
   });
 
-  ios_context.set_profile_sign_in_callback([this](uint64_t xuid) {
+  ios_context.set_profile_sign_in_callback([this](uint64_t xuid, uint32_t user_index) {
     if (!EnsureProfileServicesReady() || !emulator_ || !emulator_->kernel_state() ||
         !emulator_->kernel_state()->xam_state()) {
       return false;
@@ -1274,12 +1278,21 @@ bool EmulatorAppIOS::OnInitialize() {
       return false;
     }
 
-    for (uint8_t slot = 0; slot < XUserMaxUserCount; ++slot) {
-      if (profile_manager->GetProfile(slot)) {
-        profile_manager->Logout(slot, false);
+    if (user_index == ui::IOSWindowedAppContext::kSignInFromMenu) {
+      for (uint8_t slot = 0; slot < XUserMaxUserCount; ++slot) {
+        if (profile_manager->GetProfile(slot)) {
+          profile_manager->Logout(slot, false);
+        }
       }
+      profile_manager->Login(xuid, 0, true);
+    } else {
+      // Into the asking player's slot, leaving the others signed in.
+      uint32_t slot = user_index;
+      if (slot >= XUserMaxUserCount && emulator_->input_system()) {
+        slot = emulator_->input_system()->GetLastUsedSlot();
+      }
+      profile_manager->Login(xuid, uint8_t(slot < XUserMaxUserCount ? slot : 0), true);
     }
-    profile_manager->Login(xuid, 0, true);
     return profile_manager->GetProfile(xuid) != nullptr;
   });
 
@@ -1867,6 +1880,24 @@ void EmulatorAppIOS::StartQueuedLaunchIfIdle() {
 void EmulatorAppIOS::OnDestroy() {
   XELOGI("iOS: EmulatorAppIOS::OnDestroy invoked");
   shutting_down_.store(true, std::memory_order_release);
+  // Stopping a game can hang (a guest thread that never exits, a wait on a thread that is
+  // itself stuck). Everything the game saved is already on disk by now, so when teardown
+  // has not finished before iOS's termination limit, log where it was and leave.
+  struct TeardownState {
+    std::atomic<const char*> stage{"start"};
+    std::atomic<bool> done{false};
+  };
+  auto teardown = std::make_shared<TeardownState>();
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kTeardownDeadlineNs),
+                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                   if (teardown->done.load(std::memory_order_acquire)) {
+                     return;
+                   }
+                   XELOGE("iOS: teardown still running after {} s (stage: {}); exiting",
+                          kTeardownDeadlineNs / 1000000000, teardown->stage.load());
+                   xe::FlushLog();
+                   _exit(0);
+                 });
   {
     // Delayed stop-watchdog blocks stop touching |this| from here on.
     std::lock_guard<std::mutex> lock(stop_watchdog_->mutex);
@@ -1894,6 +1925,7 @@ void EmulatorAppIOS::OnDestroy() {
     queued_launch_path_.reset();
   }
   if (emulator_thread_.joinable()) {
+    teardown->stage.store("stopping the game", std::memory_order_release);
     RequestGameStop("OnDestroy");
     launch_condition_.notify_one();
     // Presenter destruction must run on UIKit's thread. Service Edge's UI
@@ -1902,9 +1934,11 @@ void EmulatorAppIOS::OnDestroy() {
       app_context().ExecutePendingFunctionsFromUIThread();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    teardown->stage.store("joining the emulator thread", std::memory_order_release);
     emulator_thread_.join();
     app_context().ExecutePendingFunctionsFromUIThread();
   }
+  teardown->stage.store("releasing the pause queue", std::memory_order_release);
   if (pause_queue_) {
     // The game is gone, so this returns at once; the bound is for safety.
     WaitForEmulationPauseQueue(std::chrono::milliseconds(2000));
@@ -1916,8 +1950,11 @@ void EmulatorAppIOS::OnDestroy() {
     xe_ios_session_stats_note_halted_faults(emulator_->halted_fault_count());
   }
   xe_ios_session_note_game_running(NO);
+  teardown->stage.store("destroying the emulator", std::memory_order_release);
   emulator_.reset();
+  teardown->stage.store("destroying the window", std::memory_order_release);
   window_.reset();
+  teardown->done.store(true, std::memory_order_release);
 }
 
 void EmulatorAppIOS::EmulatorThread(const std::filesystem::path& game_path,

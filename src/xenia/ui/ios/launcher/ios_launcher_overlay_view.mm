@@ -16,6 +16,7 @@
 #import "xenia/ui/ios/launcher/ios_compat_data.h"
 #import "xenia/ui/ios/launcher/ios_game_art.h"
 #import "xenia/ui/ios/launcher/ios_game_tile_cell.h"
+#import "xenia/ui/ios/launcher/ios_library_ambient_view.h"
 #import "xenia/ui/ios/shared/ios_system_link.h"
 #import "xenia/ui/ios/shared/ios_system_utils.h"
 #import "xenia/ui/ios/shared/ios_theme.h"
@@ -113,6 +114,20 @@ NSDate* XeniaIOSLastPlayedDate(uint32_t title_id) {
       dictionaryForKey:kLastPlayedDefaultsKey][xe_last_played_key(title_id)];
   return [date isKindOfClass:[NSDate class]] ? date : nil;
 }
+
+// The header's row. On a game page only its ✕ and ⋯ show, and the page's rows can reach up beside
+// them (the first row sits level with ✕ on a phone on its side), so the rest of the row lets
+// touches through.
+@interface XeniaLauncherHeaderView : UIView
+@property(nonatomic, assign) BOOL passesTouchesThrough;
+@end
+
+@implementation XeniaLauncherHeaderView
+- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+  UIView* hit = [super hitTest:point withEvent:event];
+  return hit == self && _passesTouchesThrough ? nil : hit;
+}
+@end
 
 // Target for the empty-state button. The button's action lives inside the
 // collection view's configuration, so it must not retain the overlay; the
@@ -472,13 +487,13 @@ NSAttributedString* xe_status_text(NSString* text, UIColor* color) {
 }
 
 UIButton* xe_new_notice_action(NSString* title) {
-  // A grey capsule with the action in the accent, so the row's one action reads as one.
-  UIButtonConfiguration* config = [UIButtonConfiguration filledButtonConfiguration];
+  // The action as plain accent text, like a table row's action: a capsule inside the row's own
+  // grey made a second box at the row's edge and took the detail's room. The insets keep a
+  // 44-point target and end the text as far from the row's edge as the symbol starts.
+  UIButtonConfiguration* config = [UIButtonConfiguration plainButtonConfiguration];
   config.title = title;
   config.baseForegroundColor = [XeniaTheme accent];
-  config.baseBackgroundColor = [[XeniaTheme textPrimary] colorWithAlphaComponent:0.14];
-  config.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-  config.contentInsets = NSDirectionalEdgeInsetsMake(5.0, 12.0, 5.0, 12.0);
+  config.contentInsets = NSDirectionalEdgeInsetsMake(12.0, 8.0, 12.0, 7.0);
   config.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id>*(
       NSDictionary<NSAttributedStringKey, id>* attributes) {
     NSMutableDictionary* updated = [[attributes mutableCopy] autorelease];
@@ -520,7 +535,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
 @implementation XeniaIOSLauncherOverlayView {
   // The header: the large "Library" title, then Online, the settings capsule and,
   // with the side layout, search and sort. It floats over the art and the grid.
-  UIView* _headerView;
+  XeniaLauncherHeaderView* _headerView;
   UIVisualEffectView* _headerBackdrop;
   UIStackView* _headerActions;
   UILabel* _libraryLabel;
@@ -571,6 +586,8 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   // into instead of ending at an edge.
   UIImageView* _ambientArt;
   UIView* _ambientDim;
+  // Behind everything: the Library Background, slow colour fields from the shown game's art.
+  XeniaLibraryAmbientView* _ambientField;
   // The old game's art and text fading out over the new one; see -crossfadeHeroToGame:.
   UIView* _heroFadeSnapshot;
   // The game page in place of the grid (side layout): the game it is for, its rows, ✕ and ⋯ in
@@ -599,7 +616,6 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   NSMutableSet<NSNumber*>* _pendingArtLoads;
   NSMutableSet<NSNumber*>* _pendingIconDecodes;
   BOOL _gamesLoaded;
-  BOOL _prunedArtCache;
   NSInteger _focusedGameIndex;
   BOOL _actionsEnabled;
   BOOL _controllerNavigationEnabled;
@@ -708,6 +724,9 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   _ambientDim.backgroundColor = [[XeniaTheme bgPrimary] colorWithAlphaComponent:0.55];
   [_ambientArt addSubview:_ambientDim];
   [self insertSubview:_ambientArt atIndex:0];
+  _ambientField = [[XeniaLibraryAmbientView alloc] initWithFrame:self.bounds];
+  _ambientField.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+  [self insertSubview:_ambientField atIndex:0];
 
   _heroCaption = [[UILabel alloc] init];
   _heroCaption.text =
@@ -820,7 +839,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   _headerBackdrop.userInteractionEnabled = NO;
   [self addSubview:_headerBackdrop];
 
-  _headerView = [[UIView alloc] init];
+  _headerView = [[XeniaLauncherHeaderView alloc] init];
   [self addSubview:_headerView];
 
   _libraryLabel = [[UILabel alloc] init];
@@ -1150,7 +1169,37 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
              selector:@selector(keyboardDidShow:)
                  name:UIKeyboardDidShowNotification
                object:nil];
+  [center addObserver:self
+             selector:@selector(libraryBackgroundChanged:)
+                 name:XeniaLibraryBackgroundDidChangeNotification
+               object:nil];
+  [self applyLibraryBackground];
   return self;
+}
+
+// The page shows through where the Library Background draws.
+- (void)applyLibraryBackground {
+  // Like Apple Music: over the colour field the Library is drawn dark (white text) in both modes;
+  // the field itself is a little brighter in light mode.
+  const BOOL field = _ambientField.drawsBackground;
+  self.backgroundColor = field ? UIColor.clearColor : [XeniaTheme bgPrimary];
+  self.overrideUserInterfaceStyle =
+      field ? UIUserInterfaceStyleDark : UIUserInterfaceStyleUnspecified;
+  [self setNeedsLayout];
+}
+
+- (void)libraryBackgroundChanged:(NSNotification*)__unused notification {
+  [self applyLibraryBackground];
+}
+
+- (void)setHidden:(BOOL)hidden {
+  [super setHidden:hidden];
+  // Hidden while a game runs; the background stops until the Library is back.
+  [_ambientField visibilityMayHaveChanged];
+  if (!hidden) {
+    // Covers may have been dropped under memory pressure while the game ran.
+    [self refreshVisibleCoversSoon];
+  }
 }
 
 // One notice at a time, the one that stops games first: JIT, then the memory limit, and only
@@ -1311,6 +1360,8 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
     [self placeDetailMoreButton];
     [self updateHeaderFonts];
     [_gamesCollectionView.collectionViewLayout invalidateLayout];
+    // Rotating brings other tiles on screen while covers may be landing.
+    [self refreshVisibleCoversSoon];
   }
   const BOOL hero = _heroGame != nil || _detailGame != nil || _detailClosing;
   _heroView.hidden = !hero;
@@ -1405,6 +1456,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
     _heroView.frame = CGRectMake(0.0, -top_inset, grid_frame.size.width, hero_height);
   }
   [self layoutHeroArt];
+  [self updateFieldAnchor];
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   const CGRect hero_bounds = _heroView.bounds;
@@ -1418,6 +1470,8 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   _ambientArt.alpha = ambient ? 1.0 : 0.0;
   // The dissolve masks the art and its scrims, not the hero, so the title and buttons stay whole.
   // Each mask is in its own layer's space: solid to 55% of the hero's width, clear at its edge.
+  const BOOL field = _ambientField.drawsBackground;
+  const BOOL dark_page = self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
   CAGradientLayer* (^dissolve_for)(CALayer*) = ^CAGradientLayer*(CALayer* layer) {
     const CGRect frame = [_heroView.layer convertRect:layer.bounds fromLayer:layer];
     const CGFloat width = MAX(frame.size.width, 1.0);
@@ -1425,18 +1479,46 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
     dissolve.frame = layer.bounds;
     dissolve.colors = @[ (id)UIColor.blackColor.CGColor, (id)UIColor.blackColor.CGColor,
                          (id)UIColor.clearColor.CGColor, (id)UIColor.clearColor.CGColor ];
-    const CGFloat solid_to = (hero_bounds.size.width * 0.55 - frame.origin.x) / width;
+    // Over a light background the dark art fades over a shorter run, which would otherwise read
+    // as a grey haze.
+    const CGFloat solid = field && !dark_page ? 0.75 : 0.55;
+    const CGFloat solid_to = (hero_bounds.size.width * solid - frame.origin.x) / width;
     const CGFloat clear_at = (hero_bounds.size.width - frame.origin.x) / width;
     dissolve.locations = @[ @0.0, @(MAX(solid_to, 0.0)), @(MAX(clear_at, 0.0)), @1.0 ];
     dissolve.startPoint = CGPointMake(0.0, 0.5);
     dissolve.endPoint = CGPointMake(1.0, 0.5);
     return dissolve;
   };
+  // Over the Library Background the art dissolves into it at the bottom (or, beside the grid,
+  // at its right) instead of ending in the page's colour.
+  CAGradientLayer* (^fade_down)(CALayer*) = ^CAGradientLayer*(CALayer* layer) {
+    const CGRect frame = [_heroView.layer convertRect:layer.bounds fromLayer:layer];
+    const CGFloat height = MAX(frame.size.height, 1.0);
+    CAGradientLayer* dissolve = [CAGradientLayer layer];
+    dissolve.frame = layer.bounds;
+    dissolve.colors = @[ (id)UIColor.blackColor.CGColor, (id)UIColor.blackColor.CGColor,
+                         (id)UIColor.clearColor.CGColor, (id)UIColor.clearColor.CGColor ];
+    const CGFloat solid_to =
+        (hero_bounds.size.height * (dark_page ? 0.6 : 0.75) - frame.origin.y) / height;
+    const CGFloat clear_at = (hero_bounds.size.height - frame.origin.y) / height;
+    dissolve.locations = @[ @0.0, @(MAX(solid_to, 0.0)), @(MAX(clear_at, 0.0)), @1.0 ];
+    dissolve.startPoint = CGPointMake(0.5, 0.0);
+    dissolve.endPoint = CGPointMake(0.5, 1.0);
+    return dissolve;
+  };
   _heroView.layer.mask = nil;
-  if (ambient) {
+  // A cover's blur behind the hero: over the Library Background the field draws it, lined up
+  // and toned like the rest of the page, so the page reads as one piece from top to bottom.
+  _heroArt.alpha = field && _heroArtIsCover && !ambient ? 0.0 : 1.0;
+  if (ambient || (field && side)) {
     _heroArt.layer.mask = dissolve_for(_heroArt.layer);
     _heroScrim.mask = dissolve_for(_heroScrim);
     _heroTopScrim.mask = dissolve_for(_heroTopScrim);
+    _heroView.backgroundColor = UIColor.clearColor;
+  } else if (field) {
+    _heroArt.layer.mask = fade_down(_heroArt.layer);
+    _heroScrim.mask = fade_down(_heroScrim);
+    _heroTopScrim.mask = nil;
     _heroView.backgroundColor = UIColor.clearColor;
   } else {
     _heroArt.layer.mask = nil;
@@ -1444,7 +1526,19 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
     _heroTopScrim.mask = nil;
     _heroView.backgroundColor = [XeniaTheme bgPrimary];
   }
-  if (side && ambient) {
+  if (field && !ambient) {
+    // Over the Library Background: a dark shade toward the white text at the bottom only. Fading
+    // to the page colour would haze the art where it meets the field; the mask does that edge.
+    UIColor* shade = UIColor.blackColor;
+    _heroScrim.colors = @[
+      (id)[shade colorWithAlphaComponent:0.0].CGColor,
+      (id)[shade colorWithAlphaComponent:0.0].CGColor,
+      (id)[shade colorWithAlphaComponent:0.45].CGColor
+    ];
+    _heroScrim.locations = @[ @0.0, @0.45, @1.0 ];
+    _heroScrim.startPoint = CGPointMake(0.5, 0.0);
+    _heroScrim.endPoint = CGPointMake(0.5, 1.0);
+  } else if (side && ambient) {
     // Darkens toward the text at the bottom only; the right edge is the mask's.
     _heroScrim.colors = @[
       (id)[page colorWithAlphaComponent:0.0].CGColor, (id)[page colorWithAlphaComponent:0.0].CGColor,
@@ -1515,12 +1609,35 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   }
   _headerBackdrop.alpha = alpha;
   _libraryLabel.layer.shadowOpacity = (alpha > 0.5 && !_sideLayout) ? 0.0f : 0.35f;
+  // Over the art the title is white, as the hero's own text is; on the bar it takes the theme's.
+  const BOOL over_art = !_heroView.hidden && alpha <= 0.5;
+  _libraryLabel.textColor = over_art ? UIColor.whiteColor : [XeniaTheme textPrimary];
+  if (over_art != _headerOverArt) {
+    _headerOverArt = over_art;
+    if (_headerOverArtChangedHandler) {
+      _headerOverArtChangedHandler();
+    }
+  }
 }
 
 - (void)scrollViewDidScroll:(UIScrollView*)scrollView {
   if (scrollView == _gamesCollectionView) {
     [self updateHeaderBackdrop];
+    [self updateFieldAnchor];
   }
+}
+
+// Tells the Library Background where the hero's art is, so it lines a blurred copy up with it.
+- (void)updateFieldAnchor {
+  BOOL shown = _heroArt.image && _heroView.superview && _ambientField.superview;
+  // From the hero up: the art itself may be hidden while the field draws it (a cover's blur).
+  for (UIView* view = _heroView; shown && view && view != self; view = view.superview) {
+    shown = !view.hidden && view.alpha > 0.01;
+  }
+  [_ambientField
+      setAnchorFrame:shown ? [_heroArt convertRect:_heroArt.bounds toView:_ambientField]
+                           : CGRectNull
+        contentsRect:_heroArt.layer.contentsRect];
 }
 
 #pragma mark - Continue Playing
@@ -1551,6 +1668,10 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   _heroArt.image = _heroArtIsCover ? blurred : image;
   _heroCover.image = _heroArtIsCover ? image : nil;
   _ambientArt.image = blurred;
+  [_ambientField setGameImage:image
+                          key:image ? [NSString stringWithFormat:@"%08X-%d", _heroArtTitleId,
+                                                                 _heroArtIsCover]
+                                    : nil];
   [self layoutHeroArt];
   [self setNeedsLayout];
 }
@@ -1668,6 +1789,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   _headerActions.transform = detail ? CGAffineTransformMakeTranslation(-24.0, 0.0)
                                     : CGAffineTransformIdentity;
   _headerActions.userInteractionEnabled = !detail;
+  _headerView.passesTouchesThrough = detail;
   _detailCloseButton.alpha = detail ? 1.0 : 0.0;
   _detailCloseButton.transform =
       detail ? CGAffineTransformIdentity : CGAffineTransformMakeScale(0.8, 0.8);
@@ -2064,6 +2186,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   [_pendingArtLoads release];
   [_pendingIconDecodes release];
   [_openStikDebugHandler release];
+  [_headerOverArtChangedHandler release];
   [_games release];
   [_gamesCollectionView release];
   [_settingsHandler release];
@@ -2093,6 +2216,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   [_heroCover release];
   [_ambientArt release];
   [_ambientDim release];
+  [_ambientField release];
   [_heroTopScrim release];
   [_heroText release];
   [_heroCaption release];
@@ -2703,15 +2827,6 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   }
   [self applyActionsEnabledState];
 
-  if (!_prunedArtCache && _games.count > 0) {
-    _prunedArtCache = YES;
-    NSMutableSet<NSNumber*>* keep = [NSMutableSet set];
-    for (XeniaIOSLauncherGameSnapshot* game in _games) {
-      [keep addObject:@(game.titleId)];
-    }
-    xe_prune_game_art_cache(keep);
-  }
-
   if (deletes.count == 0 && inserts.count == 0 && changed.count == 0) {
     // Nothing the grid shows has changed: leave the cells alone.
     [oldGames release];
@@ -3158,7 +3273,7 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
   xe_load_game_art_thumbnail(titleId, pixels, ^(UIImage* image) {
     if (image) {
       [_pendingArtLoads removeObject:key];
-      [self reconfigureVisibleGamesWithTitleId:titleId];
+      [self refreshVisibleCoversLoading:NO];
       return;
     }
     // Nothing on disk yet: download, then decode what arrived.
@@ -3170,10 +3285,54 @@ bool xe_snapshot_same_content(XeniaIOSLauncherGameSnapshot* a, XeniaIOSLauncherG
       xe_load_game_art_thumbnail(titleId, pixels, ^(UIImage* decoded) {
         [_pendingArtLoads removeObject:key];
         if (decoded) {
-          [self reconfigureVisibleGamesWithTitleId:titleId];
+          [self refreshVisibleCoversLoading:NO];
         }
       });
     });
+  });
+}
+
+// Puts the cached cover on every visible tile that isn't showing it, and with |load| starts loading
+// the ones that aren't cached. Tiles are matched by the title they show, not by index path: a cover
+// that lands while the grid is mid-update or mid-rotation would otherwise miss its tile, which then
+// kept its placeholder with the cover sitting in the cache.
+- (void)refreshVisibleCoversLoading:(BOOL)load {
+  for (UICollectionViewCell* visible in _gamesCollectionView.visibleCells) {
+    if (![visible isKindOfClass:[XeniaGameTileCell class]]) {
+      continue;
+    }
+    XeniaGameTileCell* cell = (XeniaGameTileCell*)visible;
+    const uint32_t titleId = cell.representedTitleId;
+    if (!titleId) {
+      continue;
+    }
+    UIImage* cover = xe_cached_game_art_thumbnail(titleId);
+    if (cover) {
+      if (cell.iconView.image != cover) {
+        cell.iconView.image = cover;
+      }
+      continue;
+    }
+    if (!load) {
+      continue;
+    }
+    for (XeniaIOSLauncherGameSnapshot* game in _shownGames) {
+      if (game.titleId == titleId) {
+        if (game.supportsRemoteArt) {
+          [self loadCoverForTitleId:titleId collectionView:_gamesCollectionView];
+        }
+        break;
+      }
+    }
+  }
+}
+
+// After the grid has laid out its new tiles.
+- (void)refreshVisibleCoversSoon {
+  [self retain];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self refreshVisibleCoversLoading:YES];
+    [self release];
   });
 }
 

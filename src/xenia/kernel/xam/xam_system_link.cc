@@ -29,7 +29,9 @@
 #include "xenia/base/logging.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
 #include "xenia/kernel/xboxkrnl/xecrypt_sha.h"
@@ -97,6 +99,13 @@ DEFINE_string(systemlink_room, "",
               "The relay room to play in: a private room's 6-character code, "
               "or empty for the title's public lobby. Players in a room can "
               "see each other's IP addresses and profile IDs.",
+              "Network");
+
+DEFINE_string(systemlink_debug_nat, "",
+              "For testing what the player is told: \"open\", \"moderate\", "
+              "\"strict\" or \"blocked\" reports that as this network's NAT "
+              "type instead of checking it with the lobby's STUN servers. "
+              "Empty checks.",
               "Network");
 
 namespace xe {
@@ -189,6 +198,9 @@ std::atomic<bool> relay_allowed{true};
 
 bool RelayAllowed() { return relay_allowed.load(std::memory_order_relaxed); }
 
+// Whether System Link was on when SystemLinkAllowedChanged last looked.
+std::atomic<bool> link_enabled_seen{false};
+
 void RefreshRelayAllowed() {
   std::lock_guard lock(relay_policy_mutex);
   relay_allowed = !relay_policy.allowed || relay_policy.allowed();
@@ -229,6 +241,10 @@ std::unique_ptr<net::secure::PacketTransport> OpenTransport(
     config.room = *room;
     config.title_id = execution.title_id;
     config.title_version = execution.version_value;
+    config.nat_override = net::relay::ParseNatType(cvars::systemlink_debug_nat);
+    if (config.nat_override == net::relay::NatType::kUnknown) {
+      config.nat_override.reset();
+    }
     config.allowed = [] { return RelayAllowed(); };
     {
       std::lock_guard lock(relay_policy_mutex);
@@ -341,11 +357,39 @@ void SetSystemLinkRelayPolicy(SystemLinkRelayPolicy policy) {
     relay_policy = std::move(policy);
   }
   RefreshRelayAllowed();
+  link_enabled_seen = SystemLinkEnabled();
 }
 
-void SystemLinkAllowedChanged() { RefreshRelayAllowed(); }
+void SystemLinkAllowedChanged() {
+  RefreshRelayAllowed();
+  const bool enabled = SystemLinkEnabled();
+  // Games hear of it as of a network cable plugged in or pulled out.
+  if (link_enabled_seen.exchange(enabled) != enabled) {
+    if (KernelState* state = kernel_state()) {
+      state->BroadcastNotification(kXNotificationLiveLinkStateChanged, enabled);
+    }
+  }
+}
 
 void SystemLinkRoomChanged() { ++relay_room_changes; }
+
+void SystemLinkOffQueried(KernelState* kernel_state) {
+  // Games ask on every frame, so only a title's first ask goes further.
+  static std::atomic<uint32_t> noted_title{0};
+  const uint32_t title_id = kernel_state->title_id();
+  if (!title_id || title_id == kDashboardID ||
+      noted_title.exchange(title_id) == title_id) {
+    return;
+  }
+  std::function<void(uint32_t)> link_off;
+  {
+    std::lock_guard lock(relay_policy_mutex);
+    link_off = relay_policy.link_off;
+  }
+  if (link_off) {
+    link_off(title_id);
+  }
+}
 
 bool CrossPlatformTitle(KernelState* kernel_state) {
   auto module = kernel_state->GetExecutableModule();

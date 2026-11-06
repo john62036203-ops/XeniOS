@@ -37,6 +37,16 @@ class IOSJitMemory {
   // after. Set once, before the first Initialize.
   using ExternalPrepareHook = void (*)(bool preparing);
   static void SetExternalPrepareHook(ExternalPrepareHook hook);
+
+  // Code is packed only in the prepared persistent mapping; elsewhere every
+  // function takes its own page, so precompiling a whole executable would fill
+  // the cache.
+  static bool PacksCode();
+  // Whether a game can only start while the JIT tool is attached: before the
+  // one-time prepare of the code region in this process. ToolAttached says
+  // whether it still is.
+  static bool NeedsAttachedTool();
+  static bool ToolAttached();
   size_t AlignOffset(size_t offset) const;
   bool BeginWrite(void* address, size_t size);
   bool EndWrite(void* address, size_t size);

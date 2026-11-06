@@ -48,6 +48,10 @@ bool IsPromotableOpcode(Opcode num) {
     case OPCODE_TRUNCATE:
     case OPCODE_LOAD_VECTOR_SHL:
     case OPCODE_LOAD_VECTOR_SHR:
+    // Locals live on the host stack, which promotion never uses (its slots go
+    // to the context); a large offset borrows x17.
+    case OPCODE_LOAD_LOCAL:
+    case OPCODE_STORE_LOCAL:
     case OPCODE_LOAD_CONTEXT:
     case OPCODE_STORE_CONTEXT:
     case OPCODE_LOAD_OFFSET:
@@ -78,6 +82,10 @@ bool IsPromotableOpcode(Opcode num) {
     case OPCODE_VECTOR_COMPARE_SGE:
     case OPCODE_VECTOR_COMPARE_UGT:
     case OPCODE_VECTOR_COMPARE_UGE:
+    case OPCODE_VECTOR_ALL_SET:
+    case OPCODE_VECTOR_CONVERT_I2F:
+    case OPCODE_VECTOR_CONVERT_F2I:
+    case OPCODE_VECTOR_NONE_SET:
     case OPCODE_ADD:
     case OPCODE_ADD_CARRY:
     case OPCODE_VECTOR_ADD:
@@ -85,6 +93,10 @@ bool IsPromotableOpcode(Opcode num) {
     case OPCODE_VECTOR_SUB:
     case OPCODE_MUL:
     case OPCODE_MUL_HI:
+    // Only the VEC128 forms reach here (float values end the plan): their
+    // sequences use v0-v3, the operands and w0, like MUL's.
+    case OPCODE_MUL_ADD:
+    case OPCODE_MUL_SUB:
     case OPCODE_NEG:
     case OPCODE_AND:
     case OPCODE_AND_NOT:
