@@ -60,6 +60,62 @@
 // the log) and the thermal state, while a game runs.
 DEFINE_bool(ios_fps_overlay, true, "Show the game's frame rate on screen while it runs.", "iOS");
 static UILabel* g_fork_fps_label = nil;
+
+#include <mach/mach.h>
+#include <unordered_map>
+
+// fork: CPU time per host thread since the previous call, busiest first, so a
+// CPU-bound game shows which emulator thread is the bottleneck (a guest thread
+// at ~100% of one core is the game's own code; the GPU command processor near
+// 100% is the draw submission).
+static void ForkLogThreadCpu(double interval_s, double* out_top_pct) {
+  static std::unordered_map<uint64_t, uint64_t> last_ns;
+  thread_act_array_t threads = nullptr;
+  mach_msg_type_number_t count = 0;
+  if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+    return;
+  }
+  struct Row { double pct; std::string name; };
+  std::vector<Row> rows;
+  std::unordered_map<uint64_t, uint64_t> now_ns;
+  double total = 0.0;
+  for (mach_msg_type_number_t i = 0; i < count; ++i) {
+    thread_identifier_info_data_t id_info;
+    mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+    thread_extended_info_data_t ext;
+    mach_msg_type_number_t n2 = THREAD_EXTENDED_INFO_COUNT;
+    if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id_info, &n) == KERN_SUCCESS &&
+        thread_info(threads[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &n2) == KERN_SUCCESS) {
+      const uint64_t ns = ext.pth_user_time + ext.pth_system_time;
+      now_ns[id_info.thread_id] = ns;
+      auto it = last_ns.find(id_info.thread_id);
+      if (it != last_ns.end() && ns >= it->second && interval_s > 0) {
+        const double pct = double(ns - it->second) / 1e9 / interval_s * 100.0;
+        total += pct;
+        if (pct >= 3.0) {
+          rows.push_back({pct, ext.pth_name[0] ? std::string(ext.pth_name) : "tid " + std::to_string(id_info.thread_id)});
+        }
+      }
+    }
+    mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+  last_ns.swap(now_ns);
+  if (rows.empty()) {
+    return;
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.pct > b.pct; });
+  if (out_top_pct) {
+    *out_top_pct = rows[0].pct;
+  }
+  std::string line;
+  for (size_t i = 0; i < rows.size() && i < 8; ++i) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s%s %.0f%%", i ? ", " : "", rows[i].name.c_str(), rows[i].pct);
+    line += buf;
+  }
+  XELOGI("[cpu] total {:.0f}% of one core, {} threads; busiest: {}", total, count, line);
+}
 #import "xenia/ui/ios/launcher/ios_compat_data.h"
 #import "xenia/ui/ios/launcher/ios_compat_report_view_controller.h"
 #import "xenia/ui/ios/launcher/ios_content_management.h"
@@ -724,6 +780,10 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
       l.hidden = NO;
       [fps_owner.view bringSubviewToFront:l];
       if (++ticks % 10 == 0) {
+        static CFTimeInterval last_cpu_time = 0;
+        double top = 0;
+        ForkLogThreadCpu(last_cpu_time > 0 ? t - last_cpu_time : 0, &top);
+        last_cpu_time = t;
         XELOGI("[fps] {:.1f} fps, thermal {}, frame {}, per frame: gpu busy {:.1f} ms, cp waits on gpu {:.1f} ms, drawable wait {:.1f} ms",
                fps, th_name, frame, gpu_ms, wait_ms, draw_ms);
       }
