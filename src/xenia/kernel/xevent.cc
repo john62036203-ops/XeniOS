@@ -100,10 +100,10 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
     Set(priority_increment, wait);
     return old_signal_state;
   }
-  if (manual_reset_) {
-    // Releases every waiter parked right now. Must precede the wake below.
-    pulse_epoch_.fetch_add(1);
-  }
+  // Releases every waiter parked right now. Must precede the wake below.
+  // fork: auto-reset too, for a host thread in a sliced WaitMultiple (no
+  // fiber is waiting here, or the set above would have taken it).
+  pulse_epoch_.fetch_add(1);
   {
     std::lock_guard<std::mutex> lock(state_lock_);
     event_->Pulse();

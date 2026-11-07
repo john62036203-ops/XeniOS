@@ -13,6 +13,8 @@
 #include <optional>
 
 #include "xenia/base/byte_stream.h"
+#include <algorithm>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/cpu/ppc/ppc_context.h"
@@ -974,14 +976,66 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
   };
   X_STATUS status;
   uint32_t boost_increment = 0;
+  // fork: a host thread (the audio worker) waiting while the guest runs on
+  // fibers. One long host WaitAny never sees a pulse that already reset the
+  // host event, nor a signal the guest wrote straight into a dispatch header,
+  // and Ninja Gaiden II's audio callback blocked on one forever. Wait in short
+  // slices, taking pulses by their epoch and guest writes by a resync, as the
+  // fiber path does, and say what the wait is stuck on after a second.
+  auto host_wait_any = [&](std::chrono::milliseconds total)
+      -> std::pair<xe::threading::WaitResult, size_t> {
+    if (!GuestScheduler::enabled()) {
+      return xe::threading::WaitAny(wait_handles, count,
+                                    alertable ? true : false, total);
+    }
+    uint32_t epochs[kMaxWaitHandles];
+    for (uint32_t i = 0; i < count; ++i) {
+      epochs[i] = objects[i]->cooperative_pulse_epoch();
+    }
+    const uint64_t start = Clock::QueryHostUptimeMillis();
+    const uint64_t end = total == std::chrono::milliseconds::max()
+                             ? UINT64_MAX
+                             : start + uint64_t(std::max<int64_t>(total.count(), 0));
+    bool reported = false;
+    while (true) {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (objects[i]->cooperative_pulse_epoch() != epochs[i]) {
+          return {xe::threading::WaitResult::kSuccess, i};
+        }
+        objects[i]->SyncFromGuest();
+      }
+      resolve_handles();
+      const uint64_t now = Clock::QueryHostUptimeMillis();
+      const uint64_t slice = end == UINT64_MAX ? 2 : std::min<uint64_t>(2, end > now ? end - now : 0);
+      auto r = xe::threading::WaitAny(wait_handles, count,
+                                      alertable ? true : false,
+                                      std::chrono::milliseconds(slice));
+      if (r.first != xe::threading::WaitResult::kTimeout || now >= end) {
+        return r;
+      }
+      if (!reported && now - start > 1000) {
+        reported = true;
+        for (uint32_t i = 0; i < count; ++i) {
+          uint32_t guest_state = 0xFFFFFFFF;
+          if (objects[i]->guest_object()) {
+            guest_state = objects[i]->memory()
+                              ->TranslateVirtual<X_DISPATCH_HEADER*>(
+                                  objects[i]->guest_object())
+                              ->signal_state;
+          }
+          XELOGW("[wait-diag] host thread stuck >1s in WaitAny({}): #{} type {} handle {:08X} guest_signal {} name '{}'",
+                 count, i, static_cast<uint32_t>(objects[i]->type()),
+                 objects[i]->handle(), guest_state, objects[i]->name());
+        }
+      }
+    }
+  };
   if (wait_type) {
-    auto result = xe::threading::WaitAny(wait_handles, count,
-                                         alertable ? true : false, timeout_ms);
+    auto result = host_wait_any(timeout_ms);
     while (result.first == xe::threading::WaitResult::kUserCallback &&
            RunKernelApcsForHostWait(alertable != 0)) {
       resolve_handles();
-      result = xe::threading::WaitAny(wait_handles, count,
-                                      alertable ? true : false, remaining());
+      result = host_wait_any(remaining());
     }
     switch (result.first) {
       case xe::threading::WaitResult::kSuccess:

@@ -64,6 +64,7 @@ DEFINE_bool(ios_fps_overlay, true, "Show the game's frame rate on screen while i
 static UILabel* g_fork_fps_label = nil;
 
 #include <mach/mach.h>
+#include <pthread.h>
 #include <unordered_map>
 
 // fork: CPU time per host thread since the previous call, busiest first, so a
@@ -84,18 +85,24 @@ static void ForkLogThreadCpu(double interval_s, double* out_top_pct) {
   for (mach_msg_type_number_t i = 0; i < count; ++i) {
     thread_identifier_info_data_t id_info;
     mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
-    thread_extended_info_data_t ext;
-    mach_msg_type_number_t n2 = THREAD_EXTENDED_INFO_COUNT;
+    thread_basic_info_data_t basic;
+    mach_msg_type_number_t n2 = THREAD_BASIC_INFO_COUNT;
     if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id_info, &n) == KERN_SUCCESS &&
-        thread_info(threads[i], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &n2) == KERN_SUCCESS) {
-      const uint64_t ns = ext.pth_user_time + ext.pth_system_time;
+        thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&basic, &n2) == KERN_SUCCESS) {
+      const uint64_t ns =
+          (uint64_t(basic.user_time.seconds) + basic.system_time.seconds) * 1000000000ull +
+          (uint64_t(basic.user_time.microseconds) + basic.system_time.microseconds) * 1000ull;
+      char pth_name[64] = {};
+      if (pthread_t pt = pthread_from_mach_thread_np(threads[i])) {
+        pthread_getname_np(pt, pth_name, sizeof(pth_name));
+      }
       now_ns[id_info.thread_id] = ns;
       auto it = last_ns.find(id_info.thread_id);
       if (it != last_ns.end() && ns >= it->second && interval_s > 0) {
         const double pct = double(ns - it->second) / 1e9 / interval_s * 100.0;
         total += pct;
         if (pct >= 3.0) {
-          rows.push_back({pct, ext.pth_name[0] ? std::string(ext.pth_name) : "tid " + std::to_string(id_info.thread_id)});
+          rows.push_back({pct, pth_name[0] ? std::string(pth_name) : "tid " + std::to_string(id_info.thread_id)});
         }
       }
     }
@@ -104,6 +111,9 @@ static void ForkLogThreadCpu(double interval_s, double* out_top_pct) {
   vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
   last_ns.swap(now_ns);
   if (rows.empty()) {
+    if (interval_s > 0) {
+      XELOGI("[cpu] no busy threads measured ({} threads, total {:.0f}%)", count, total);
+    }
     return;
   }
   std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.pct > b.pct; });
