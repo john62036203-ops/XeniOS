@@ -543,9 +543,54 @@ xe::threading::WaitHandle* XObject::GetWaitHandleForCurrentThread(size_t slot) {
   return GetWaitHandle();
 }
 
+// fork: what the audio worker waits on. Its guest callback never returns in
+// Ninja Gaiden II with the guest scheduler on; this says on what, with the
+// timeout and how often it calls, at most once per 2 s.
+static void ForkTraceAudioWait(const char* kind, uint32_t count,
+                               XObject* const* objects, uint32_t wait_type,
+                               uint64_t* opt_timeout) {
+  XThread* thread = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
+  if (!thread || thread->name() != "Audio Worker") {
+    return;
+  }
+  static thread_local uint64_t calls = 0, last_ms = 0, reports = 0;
+  ++calls;
+  const uint64_t now = Clock::QueryHostUptimeMillis();
+  if (now - last_ms < 2000 || reports >= 40) {
+    return;
+  }
+  last_ms = now;
+  ++reports;
+  std::string timeout = "infinite";
+  if (opt_timeout) {
+    const int64_t t = int64_t(*opt_timeout);
+    timeout = t < 0 ? std::to_string(-t / 10000) + "ms relative"
+                    : (t == 0 ? "0 (poll)" : "absolute " + std::to_string(t));
+  }
+  std::string what;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t guest_state = 0xFFFFFFFF;
+    if (objects[i]->guest_object()) {
+      guest_state = objects[i]->memory()
+                        ->TranslateVirtual<X_DISPATCH_HEADER*>(
+                            objects[i]->guest_object())
+                        ->signal_state;
+    }
+    what += fmt::format(" [#{} type {} handle {:08X} guest_signal {} name '{}']", i,
+                        static_cast<uint32_t>(objects[i]->type()),
+                        objects[i]->handle(), guest_state, objects[i]->name());
+  }
+  XELOGW("[wait-diag] audio worker {} calls so far {}, wait_type {}, timeout {}:{}",
+         kind, calls, wait_type, timeout, what);
+}
+
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                        uint32_t alertable, uint64_t* opt_timeout,
                        bool interruptible) {
+  {
+    XObject* self_object = this;
+    ForkTraceAudioWait("Wait", 1, &self_object, 0, opt_timeout);
+  }
   auto wait_handle = GetWaitHandleForCurrentThread(0);
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -823,6 +868,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
   if (count > kMaxWaitHandles) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  ForkTraceAudioWait("WaitMultiple", count, objects, wait_type, opt_timeout);
 
   // Resolved per caller, so a mutant this thread already owns cannot deadlock
   // a WaitAll on itself.
