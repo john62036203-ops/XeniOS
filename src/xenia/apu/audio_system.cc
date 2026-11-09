@@ -15,6 +15,8 @@
 #include <thread>
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <pthread.h>
+#include <cstring>
 #include "xenia/cpu/ppc/ppc_context.h"
 
 #include "xenia/apu/apu_flags.h"
@@ -69,26 +71,9 @@ std::atomic<uint64_t> g_ad_cb_max_us{0}, g_ad_cb_since_us{0}, g_ad_parked{0};
 std::atomic<bool> g_ad_started{false};
 std::atomic<xe::cpu::ppc::PPCContext*> g_ad_ctx{nullptr};
 std::atomic<mach_port_t> g_ad_mach{MACH_PORT_NULL};
-// When the worker has been inside one guest callback for >1 s: the guest
-// registers and the host call stack of the worker, to see what it waits on.
-void AdDumpStuck() {
-  // fork: once, every fiber and what it waits on, plus recent signals, to find
-  // who should set the two events the audio callback waits for.
-  static std::atomic<bool> dumped_fibers{false};
-  if (!dumped_fibers.exchange(true)) {
-    auto* ks = xe::kernel::kernel_state();
-    if (ks && xe::kernel::GuestScheduler::enabled() && ks->guest_scheduler()) {
-      XELOGW("[audio-diag] fiber dump follows");
-      ks->guest_scheduler()->DiagnosticDump();
-    }
-  }
-  if (auto* ctx = g_ad_ctx.load()) {
-    XELOGI("[audio-diag] stuck guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X}",
-           uint32_t(ctx->lr), uint32_t(ctx->ctr), uint32_t(ctx->r[1]), uint32_t(ctx->r[3]),
-           uint32_t(ctx->r[4]), uint32_t(ctx->r[5]));
-  }
-  mach_port_t th = g_ad_mach.load();
-  if (th == MACH_PORT_NULL) return;
+void AdDumpHostStack(mach_port_t th, const char* label) {
+  if (th == MACH_PORT_NULL || th == mach_thread_self()) return;
+  XELOGI("[audio-diag] host stack of {}", label);
 #if defined(__aarch64__)
   arm_thread_state64_t st;
   mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
@@ -129,6 +114,46 @@ void AdDumpStuck() {
   }
   thread_resume(th);
 #endif
+}
+
+// When the worker has been inside one guest callback for >1 s: the guest
+// registers and the host call stack of the worker, to see what it waits on.
+void AdDumpStuck() {
+  // fork: once, every fiber and what it waits on, plus recent signals, to find
+  // who should set the two events the audio callback waits for.
+  static std::atomic<bool> dumped_fibers{false};
+  if (!dumped_fibers.exchange(true)) {
+    auto* ks = xe::kernel::kernel_state();
+    if (ks && xe::kernel::GuestScheduler::enabled() && ks->guest_scheduler()) {
+      XELOGW("[audio-diag] fiber dump follows");
+      ks->guest_scheduler()->DiagnosticDump();
+    }
+  }
+  if (auto* ctx = g_ad_ctx.load()) {
+    XELOGI("[audio-diag] stuck guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X}",
+           uint32_t(ctx->lr), uint32_t(ctx->ctr), uint32_t(ctx->r[1]), uint32_t(ctx->r[3]),
+           uint32_t(ctx->r[4]), uint32_t(ctx->r[5]));
+  }
+  AdDumpHostStack(g_ad_mach.load(), "Audio Worker");
+  // fork: also the host stacks of the guest CPU dispatch threads, to see
+  // whether the audio fibers on CPU 4/5 sit in a host wait or a spin.
+  static std::atomic<int> cpu_dumps{0};
+  if (cpu_dumps.fetch_add(1) < 2) {
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &threads, &n) == KERN_SUCCESS) {
+      for (mach_msg_type_number_t i = 0; i < n; ++i) {
+        char name[64] = {};
+        pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+        if (pt) pthread_getname_np(pt, name, sizeof(name));
+        if (std::strncmp(name, "Guest CPU", 9) == 0) {
+          AdDumpHostStack(threads[i], name);
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+      }
+      vm_deallocate(mach_task_self(), (vm_address_t)threads, n * sizeof(thread_act_t));
+    }
+  }
 }
 uint64_t AdNowUs() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
