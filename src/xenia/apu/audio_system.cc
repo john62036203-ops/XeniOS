@@ -33,6 +33,10 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/guest_scheduler.h"
+namespace xe::kernel {
+KernelState* kernel_state();
+}
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -68,6 +72,16 @@ std::atomic<mach_port_t> g_ad_mach{MACH_PORT_NULL};
 // When the worker has been inside one guest callback for >1 s: the guest
 // registers and the host call stack of the worker, to see what it waits on.
 void AdDumpStuck() {
+  // fork: once, every fiber and what it waits on, plus recent signals, to find
+  // who should set the two events the audio callback waits for.
+  static std::atomic<bool> dumped_fibers{false};
+  if (!dumped_fibers.exchange(true)) {
+    auto* ks = xe::kernel::kernel_state();
+    if (ks && xe::kernel::GuestScheduler::enabled() && ks->guest_scheduler()) {
+      XELOGW("[audio-diag] fiber dump follows");
+      ks->guest_scheduler()->DiagnosticDump();
+    }
+  }
   if (auto* ctx = g_ad_ctx.load()) {
     XELOGI("[audio-diag] stuck guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X}",
            uint32_t(ctx->lr), uint32_t(ctx->ctr), uint32_t(ctx->r[1]), uint32_t(ctx->r[3]),

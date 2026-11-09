@@ -550,7 +550,7 @@ static void ForkTraceAudioWait(const char* kind, uint32_t count,
                                XObject* const* objects, uint32_t wait_type,
                                uint64_t* opt_timeout) {
   XThread* thread = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
-  if (!thread || thread->name() != "Audio Worker") {
+  if (!thread || thread->name().rfind("Audio Worker", 0) != 0) {
     return;
   }
   static thread_local uint64_t calls = 0, last_ms = 0, reports = 0;

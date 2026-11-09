@@ -214,6 +214,9 @@ class GuestScheduler {
 
   KernelState* kernel_state() const { return kernel_state_; }
 
+  // fork: the fiber/wait dump, on demand, for the stuck audio worker.
+  void DiagnosticDump() { ReportNoProgress(); }
+
  private:
   // Xbox 360 logical CPU count, also the maximum number of dispatch threads.
   static constexpr int kMaxCpus = 6;
