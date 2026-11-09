@@ -461,6 +461,9 @@ jobs:
           # for the stamping at the end.
           XENIOS_BUILD_ATTESTATION_KEY: "${{ (needs.resolve-metadata.outputs.publish == 'true' || github.ref == 'refs/heads/xenios') && secrets.XENIOS_BUILD_ATTESTATION_KEY || '' }}"
           XENIOS_BUILD_ATTESTATION_KEY_ID: "${{ secrets.XENIOS_BUILD_ATTESTATION_KEY_ID }}"
+          # fork: one fixed bundle ID, so each fork build installs over the last
+          # in LiveContainer instead of beside it (a random ID makes a new app).
+          XENIOS_IOS_BUNDLE_ID: "${{ github.repository_owner == 'john62036203-ops' && 'com.xenios.jp' || '' }}"
           # Where the app sends diagnostics. The URL isn't secret, so a repository
           # variable can override the Worker's address.
           XENIOS_DIAGNOSTICS_URL: "${{ vars.XENIOS_DIAGNOSTICS_URL || 'https://xenios-diagnostics.xenios.workers.dev/v1/diag' }}"
