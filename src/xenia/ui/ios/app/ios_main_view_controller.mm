@@ -15,6 +15,11 @@
 #include "xenia/ui/ios/shared/ios_edge_adapter.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <unordered_map>
+#include <dlfcn.h>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -66,6 +71,95 @@ static UILabel* g_fork_fps_label = nil;
 #include <mach/mach.h>
 #include <pthread.h>
 #include <unordered_map>
+
+// fork: sampling profile of the "Guest CPU 0" dispatch thread (the game's
+// main thread), every 2 ms for 10 s at a time. Splits its time into guest code
+// (JIT) and the host functions it calls, with each host function's caller.
+static void ForkStartGuestCpuProfiler() {
+  static std::atomic<bool> started{false};
+  if (started.exchange(true)) return;
+  std::thread([] {
+    pthread_setname_np("Fork Profiler");
+    for (int window = 0; window < 180; ++window) {  // ~30 minutes
+      mach_port_t target = MACH_PORT_NULL;
+      thread_act_array_t threads = nullptr;
+      mach_msg_type_number_t count = 0;
+      if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < count; ++i) {
+          char name[64] = {};
+          if (pthread_t pt = pthread_from_mach_thread_np(threads[i])) {
+            pthread_getname_np(pt, name, sizeof(name));
+          }
+          if (target == MACH_PORT_NULL && std::strcmp(name, "Guest CPU 0") == 0) {
+            target = threads[i];
+          } else {
+            mach_port_deallocate(mach_task_self(), threads[i]);
+          }
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+      }
+      if (target == MACH_PORT_NULL) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        continue;
+      }
+      std::vector<std::pair<uint64_t, uint64_t>> samples;
+      samples.reserve(5000);
+      const auto window_end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (std::chrono::steady_clock::now() < window_end) {
+#if defined(__aarch64__)
+        if (thread_suspend(target) == KERN_SUCCESS) {
+          arm_thread_state64_t st;
+          mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+          const bool ok = thread_get_state(target, ARM_THREAD_STATE64, (thread_state_t)&st, &n) ==
+                          KERN_SUCCESS;
+          thread_resume(target);
+          if (ok) {
+            samples.push_back({arm_thread_state64_get_pc(st) & 0x0000FFFFFFFFFFFFull,
+                               arm_thread_state64_get_lr(st) & 0x0000FFFFFFFFFFFFull});
+          }
+        }
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      mach_port_deallocate(mach_task_self(), target);
+      if (samples.empty()) continue;
+      auto sym = [](uint64_t pc) -> std::string {
+        Dl_info info = {};
+        if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fbase) {
+          if (info.dli_sname) return info.dli_sname;
+          const char* f = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
+          return std::string(f ? f + 1 : "?") + "+?";
+        }
+        return "JIT";
+      };
+      std::unordered_map<std::string, uint32_t> by_fn;
+      std::unordered_map<std::string, uint32_t> by_fn_caller;
+      for (const auto& s : samples) {
+        const std::string fn = sym(s.first);
+        ++by_fn[fn];
+        if (fn != "JIT") {
+          ++by_fn_caller[fn + " <- " + sym(s.second)];
+        }
+      }
+      auto top = [&](std::unordered_map<std::string, uint32_t>& m, size_t k) {
+        std::vector<std::pair<uint32_t, std::string>> v;
+        for (auto& e : m) v.push_back({e.second, e.first});
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        if (v.size() > k) v.resize(k);
+        return v;
+      };
+      const double total = double(samples.size());
+      XELOGI("[prof] Guest CPU 0, {} samples in 10 s (frame {}):", samples.size(),
+             xe::logging::GetFrameNumber());
+      for (auto& e : top(by_fn, 15)) {
+        XELOGI("[prof]   {:5.1f}%  {}", e.first * 100.0 / total, e.second);
+      }
+      for (auto& e : top(by_fn_caller, 10)) {
+        XELOGI("[prof]   caller {:5.1f}%  {}", e.first * 100.0 / total, e.second);
+      }
+    }
+  }).detach();
+}
 
 // fork: CPU time per host thread since the previous call, busiest first, so a
 // CPU-bound game shows which emulator thread is the bottleneck (a guest thread
@@ -811,6 +905,7 @@ NSString* const kZarSuggestionDismissedBytesKey = @"XeniaZarSuggestionDismissedB
         static CFTimeInterval last_cpu_time = 0;
         double top = 0;
         ForkLogThreadCpu(last_cpu_time > 0 ? t - last_cpu_time : 0, &top);
+        ForkStartGuestCpuProfiler();
         last_cpu_time = t;
         XELOGI("[fps] {:.1f} fps, thermal {}, frame {}, per frame: gpu busy {:.1f} ms, cp waits on gpu {:.1f} ms, drawable wait {:.1f} ms",
                fps, th_name, frame, gpu_ms, wait_ms, draw_ms);

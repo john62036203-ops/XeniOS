@@ -996,7 +996,6 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
     const uint64_t end = total == std::chrono::milliseconds::max()
                              ? UINT64_MAX
                              : start + uint64_t(std::max<int64_t>(total.count(), 0));
-    bool reported = false;
     while (true) {
       for (uint32_t i = 0; i < count; ++i) {
         if (objects[i]->cooperative_pulse_epoch() != epochs[i]) {
@@ -1012,21 +1011,6 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                                       std::chrono::milliseconds(slice));
       if (r.first != xe::threading::WaitResult::kTimeout || now >= end) {
         return r;
-      }
-      if (!reported && now - start > 1000) {
-        reported = true;
-        for (uint32_t i = 0; i < count; ++i) {
-          uint32_t guest_state = 0xFFFFFFFF;
-          if (objects[i]->guest_object()) {
-            guest_state = objects[i]->memory()
-                              ->TranslateVirtual<X_DISPATCH_HEADER*>(
-                                  objects[i]->guest_object())
-                              ->signal_state;
-          }
-          XELOGW("[wait-diag] host thread stuck >1s in WaitAny({}): #{} type {} handle {:08X} guest_signal {} name '{}'",
-                 count, i, static_cast<uint32_t>(objects[i]->type()),
-                 objects[i]->handle(), guest_state, objects[i]->name());
-        }
       }
     }
   };
