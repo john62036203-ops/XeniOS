@@ -80,6 +80,7 @@ static void ForkStartGuestCpuProfiler() {
   if (started.exchange(true)) return;
   std::thread([] {
     pthread_setname_np("Fork Profiler");
+    XELOGI("[prof] profiler thread started");
     for (int window = 0; window < 180; ++window) {  // ~30 minutes
       mach_port_t target = MACH_PORT_NULL;
       thread_act_array_t threads = nullptr;
@@ -99,21 +100,26 @@ static void ForkStartGuestCpuProfiler() {
         vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
       }
       if (target == MACH_PORT_NULL) {
+        XELOGI("[prof] no 'Guest CPU 0' thread among {} threads yet", count);
         std::this_thread::sleep_for(std::chrono::seconds(10));
         continue;
       }
+      uint32_t suspend_fail = 0, state_fail = 0;
       std::vector<std::pair<uint64_t, uint64_t>> samples;
       samples.reserve(5000);
       const auto window_end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
       while (std::chrono::steady_clock::now() < window_end) {
 #if defined(__aarch64__)
-        if (thread_suspend(target) == KERN_SUCCESS) {
+        if (thread_suspend(target) != KERN_SUCCESS) {
+          ++suspend_fail;
+        } else {
           arm_thread_state64_t st;
           mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
           const bool ok = thread_get_state(target, ARM_THREAD_STATE64, (thread_state_t)&st, &n) ==
                           KERN_SUCCESS;
           thread_resume(target);
-          if (ok) {
+          if (!ok) ++state_fail;
+          if (ok && samples.size() < samples.capacity()) {
             samples.push_back({arm_thread_state64_get_pc(st) & 0x0000FFFFFFFFFFFFull,
                                arm_thread_state64_get_lr(st) & 0x0000FFFFFFFFFFFFull});
           }
@@ -122,6 +128,8 @@ static void ForkStartGuestCpuProfiler() {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
       }
       mach_port_deallocate(mach_task_self(), target);
+      XELOGI("[prof] window {}: {} samples, suspend failures {}, state failures {}", window,
+             samples.size(), suspend_fail, state_fail);
       if (samples.empty()) continue;
       auto sym = [](uint64_t pc) -> std::string {
         Dl_info info = {};
@@ -134,11 +142,17 @@ static void ForkStartGuestCpuProfiler() {
       };
       std::unordered_map<std::string, uint32_t> by_fn;
       std::unordered_map<std::string, uint32_t> by_fn_caller;
+      std::unordered_map<uint64_t, std::string> cache;
+      auto csym = [&](uint64_t pc) -> const std::string& {
+        auto it = cache.find(pc);
+        if (it == cache.end()) it = cache.emplace(pc, sym(pc)).first;
+        return it->second;
+      };
       for (const auto& s : samples) {
-        const std::string fn = sym(s.first);
+        const std::string fn = csym(s.first);
         ++by_fn[fn];
         if (fn != "JIT") {
-          ++by_fn_caller[fn + " <- " + sym(s.second)];
+          ++by_fn_caller[fn + " <- " + csym(s.second)];
         }
       }
       auto top = [&](std::unordered_map<std::string, uint32_t>& m, size_t k) {
