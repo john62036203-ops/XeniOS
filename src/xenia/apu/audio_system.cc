@@ -36,10 +36,6 @@
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/guest_scheduler.h"
-#include "xenia/kernel/xthread.h"
-#include "xenia/memory.h"
-#include "xenia/base/byte_order.h"
-#include <cstdio>
 namespace xe::kernel {
 KernelState* kernel_state();
 }
@@ -120,57 +116,6 @@ void AdDumpHostStack(mach_port_t th, const char* label) {
 #endif
 }
 
-// fork: guest code and the audio threads' registers, to disassemble offline
-// and see what the CPU 4/5 audio fibers spin on.
-void AdDumpGuest() {
-  auto* ks = xe::kernel::kernel_state();
-  if (!ks) return;
-  auto* mem = ks->memory();
-  auto dump = [&](const char* tag, uint32_t start, uint32_t len) {
-    start &= ~31u;
-    for (uint32_t a = start; a < start + len; a += 32) {
-      uint32_t prot = 0;
-      auto* heap = mem->LookupHeap(a);
-      if (!heap || !heap->QueryProtect(a, &prot) || !(prot & xe::kMemoryProtectRead)) {
-        XELOGI("[guest-dump] {} {:08X}: unreadable", tag, a);
-        return;
-      }
-      uint32_t w[8];
-      for (int i = 0; i < 8; ++i) {
-        w[i] = xe::load_and_swap<uint32_t>(mem->TranslateVirtual<const uint8_t*>(a + i * 4));
-      }
-      XELOGI("[guest-dump] {} {:08X}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-             tag, a, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-    }
-  };
-  dump("code", 0x8374E600, 0xC00);
-  auto threads = ks->object_table()->GetObjectsByType<xe::kernel::XThread>();
-  for (auto& t : threads) {
-    if (!t->thread_state()) continue;
-    auto* c = t->thread_state()->context();
-    if (!c) continue;
-    const uint32_t lr = uint32_t(c->lr);
-    const bool audio_code = lr >= 0x8374E000 && lr < 0x83750000;
-    if (!audio_code) continue;
-    XELOGI("[guest-dump] thread tid={:08X} '{}' lr={:08X} ctr={:08X}", t->thread_id(),
-           t->name(), lr, uint32_t(c->ctr));
-    for (int r = 0; r < 32; r += 8) {
-      XELOGI("[guest-dump]   r{}-r{}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}", r,
-             r + 7, uint32_t(c->r[r]), uint32_t(c->r[r + 1]), uint32_t(c->r[r + 2]),
-             uint32_t(c->r[r + 3]), uint32_t(c->r[r + 4]), uint32_t(c->r[r + 5]),
-             uint32_t(c->r[r + 6]), uint32_t(c->r[r + 7]));
-    }
-    for (int r = 1; r < 32; ++r) {
-      const uint32_t v = uint32_t(c->r[r]);
-      if (v >= 0x40000000 && v < 0xC0000000 && !(v >= 0x82000000 && v < 0x84000000)) {
-        char tag[32];
-        std::snprintf(tag, sizeof(tag), "t%X.r%d", t->thread_id(), r);
-        dump(tag, v - (r == 1 ? 0 : 0x20), r == 1 ? 0x100 : 0x60);
-      }
-    }
-  }
-}
-
 // When the worker has been inside one guest callback for >1 s: the guest
 // registers and the host call stack of the worker, to see what it waits on.
 void AdDumpStuck() {
@@ -183,7 +128,6 @@ void AdDumpStuck() {
       XELOGW("[audio-diag] fiber dump follows");
       ks->guest_scheduler()->DiagnosticDump();
     }
-    AdDumpGuest();
   }
   if (auto* ctx = g_ad_ctx.load()) {
     XELOGI("[audio-diag] stuck guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r5={:08X}",
